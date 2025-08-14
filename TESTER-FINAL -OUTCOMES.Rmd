@@ -1,0 +1,1509 @@
+
+---
+title: "Bayesian Network Meta‑analysis – `r params$outcome`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+params:
+  outcome: SOL                                              # ← change for each sheet: "SOL", "PSQI", "WASO", "TST", "SE", "NOA", "ISI"
+  file_path: C:/Users/risha/OneDrive/Desktop/Insomnia_consol_NMA.xlsx
+  reference: Placebo
+  mcmc_fast: 'false'
+  output_path: C:/Users/risha/OneDrive/Desktop/NMA
+  prospero_id: CRD420251088062
+---
+
+```{r setup, include = FALSE}
+# ---- global knitr options ----
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 7
+)
+
+# ---- reproducibility ----
+set.seed(123)
+```
+
+
+# User inputs & Settings
+```{r user_inputs}
+OUTCOME_NAME <- params$outcome
+FILE_PATH    <- params$file_path
+REFERENCE_TRT<- params$reference
+FAST         <- isTRUE(params$mcmc_fast)
+OUTPUT_PATH  <- params$output_path
+
+# Define outcome directions lookup table
+outcome_directions <- list(
+  SOL = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced sleep onset latency"
+  ),
+  PSQI = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced sleep disturbance"
+  ),
+  WASO = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced wake after sleep onset"
+  ),
+  NOA = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced number of awakenings"
+  ),
+  ISI = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced insomnia severity"
+  ),
+  TST = list(
+    larger_better = TRUE,
+    direction = "higher",
+    interpretation = "Increased total sleep time"
+  ),
+  SE = list(
+    larger_better = TRUE,
+    direction = "higher",
+    interpretation = "Increased sleep efficiency"
+  )
+)
+
+outcome_settings <- outcome_directions[[OUTCOME_NAME]]
+
+LARGER_BETTER <- outcome_settings$larger_better
+DIRECTION <- outcome_settings$direction
+INTERPRETATION <- outcome_settings$interpretation
+
+
+#output settings
+BASE_DIR <- file.path(OUTPUT_PATH, OUTCOME_NAME)
+FIGURES_DIR <- file.path(BASE_DIR, "figures")
+TABLES_DIR  <- file.path(BASE_DIR, "tables")
+
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+FIG_DPI <- 600
+FIG_FORMAT <- "tiff"
+COMPRESSION <- "lzw"
+
+# MCMC settings (set for protocol)
+ITER  <- if (FAST) 200 else 100000
+BURN  <- if (FAST) 100 else  50000
+ADAPT <- if (FAST)  20  else   5000
+CHAINS<- 3
+
+```
+
+```{r protocol_info, results='asis'}
+cat("**PROSPERO Registration:** ", params$prospero_id, "\n\n")
+cat("[View Registration on PROSPERO](https://www.crd.york.ac.uk/PROSPERO/view/CRD420251088062)\n\n")
+cat("[View Full Protocol PDF](https://www.crd.york.ac.uk/PROSPEROFILES/6489999c15d03b3e3e0ef520becaa456.pdf)\n\n")
+cat("**Outcome analyzed:** ", OUTCOME_NAME, "\n\n")
+cat("**Direction of benefit:** ", ifelse(LARGER_BETTER, "Larger is better", "Smaller is better"), "\n\n")
+cat("**Positive effect interpretation:** ", INTERPRETATION, "\n\n")
+cat("*Analysis conducted according to pre-registered protocol*\n\n")
+
+```
+
+```{r save_functions}
+# Function to save figures
+save_figure <- function(plot_object, filename) {
+  full_path <- file.path(FIGURES_DIR, paste0(filename, "_", OUTCOME_NAME, ".", FIG_FORMAT))
+  
+  if ("ggplot" %in% class(plot_object)) {
+    ggsave(filename = full_path, plot = plot_object, dpi = FIG_DPI, 
+           compression = COMPRESSION, bg = "white")
+  } else {
+    tiff(full_path, res = FIG_DPI, compression = COMPRESSION)
+    print(plot_object)
+    dev.off()
+  }
+  cat("Figure saved:", full_path, "\n")
+}
+
+# Function to save tables as images and csv data
+save_table <- function(table_data, filename, caption = "") {
+  csv_path <- file.path(TABLES_DIR, paste0(filename, "_", OUTCOME_NAME, ".csv"))
+  tiff_path <- file.path(TABLES_DIR, paste0(filename, "_", OUTCOME_NAME, ".tiff"))
+  
+  write.csv(table_data, csv_path, row.names = FALSE)
+  
+  if (require(kableExtra, quietly = TRUE) && require(webshot2, quietly = TRUE)) {
+    formatted_table <- knitr::kable(table_data, caption = caption, format = "html") %>%
+      kableExtra::kable_styling(full_width = FALSE, font_size = 12)
+    
+    kableExtra::save_kable(formatted_table, file = tiff_path, zoom = 2)
+    cat("Table image saved:", tiff_path, "\n")
+  }
+  cat("Table data saved:", csv_path, "\n")
+}
+```
+
+
+
+# 1. Load libraries
+```{r libs}
+# set CRAN mirror if none
+if (getOption("repos")[["CRAN"]] %in% c("@CRAN@", NULL)) {
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
+}
+
+required_pkgs <- c(
+  "tidyverse", "readxl", "BUGSnet", "R2jags",
+  "meta", "metafor", "tidygraph", "ggraph",
+  "igraph", "kableExtra", "gridExtra", "RColorBrewer",
+  "remotes"
+)
+
+for (p in required_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, dependencies = TRUE)
+  library(p, character.only = TRUE)
+}
+```
+
+```{r session-info, class.source='fold-show', collapse=TRUE}
+sessioninfo::session_info()
+```
+
+
+# 2. Load & prepare data
+```{r load_data}
+data_raw <- readxl::read_excel(FILE_PATH, sheet = OUTCOME_NAME) %>%
+  mutate(across(c(mean, sd, n, dose, duration, year, age, age_sd, female_percent),
+                as.numeric),
+         outcome = OUTCOME_NAME,
+         largerbetter = LARGER_BETTER) %>%
+  filter(!is.na(mean), !is.na(sd), !is.na(n), !is.na(treatment), !is.na(study))
+
+# quick checks
+cat("Rows :", nrow(data_raw), "\n",
+    "Studies :", dplyr::n_distinct(data_raw$study), "\n",
+    "Treatments :", dplyr::n_distinct(data_raw$treatment), "\n")
+
+knitr::kable(
+  data_raw %>% 
+    group_by(treatment_class) %>%
+    summarise(n_studies = n_distinct(study),
+              total_n   = sum(n), .groups = "drop"),
+  caption = glue::glue("Summary by treatment class – {OUTCOME_NAME}")
+) %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+# 3. Pair‑wise meta‑analysis
+```{r pairwise}
+# Helper to run one pairwise MA (continuous => SMD)
+pairwise_cont <- function(comp_trt, df, reference) {
+  df_wide <- df %>% 
+    filter(treatment_class %in% c(comp_trt, reference)) %>% 
+    select(study, treatment_class, mean, sd, n) %>% 
+    pivot_wider(names_from = treatment_class,
+                values_from = c(mean, sd, n),
+                names_glue = "{.value}.{treatment_class}") %>% 
+    drop_na()
+
+  if (nrow(df_wide) < 2) return(NULL)
+
+  meta::metacont(
+    n.e    = df_wide[[paste0("n.", comp_trt)]],
+    mean.e = df_wide[[paste0("mean.", comp_trt)]],
+    sd.e   = df_wide[[paste0("sd.", comp_trt)]],
+    n.c    = df_wide[[paste0("n.", reference)]],
+    mean.c = df_wide[[paste0("mean.", reference)]],
+    sd.c   = df_wide[[paste0("sd.", reference)]],
+    studlab = df_wide$study,
+    sm = "SMD",
+    hakn = FALSE,
+    method.tau = "REML",
+    byvar = NULL,
+    print = FALSE
+  )
+}
+
+comps <- setdiff(unique(data_raw$treatment_class), REFERENCE_TRT)
+
+pma_list <- purrr::map(comps, pairwise_cont, df = data_raw, reference = REFERENCE_TRT)
+names(pma_list) <- comps
+
+# table of pooled estimates
+pairwise_res <- purrr::map_dfr(
+  pma_list,
+  function(.x) {
+    if (is.null(.x)) return(NULL)
+    
+    tibble(
+      comparison = paste(.x$treat.e, "vs.", .x$treat.c),
+      TE  = round(as.numeric(.x$TE.random), 2),
+      LCL = round(as.numeric(.x$lower.random), 2),
+      UCL = round(as.numeric(.x$upper.random), 2),
+      I2  = round(as.numeric(.x$I2), 2),
+      tau2       = round(as.numeric(.x$tau2), 2)
+    )
+  },
+  .id = "treatment"
+)
+
+
+knitr::kable(pairwise_res, caption = "Pair‑wise SMD vs Placebo") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+
+# 4. Network preparation (BUGSnet)
+```{r prep_bugsnet}
+data_prep <- data.prep(
+  arm.data  = data_raw,
+  varname.t = "treatment_class",
+  varname.s = "study"
+)
+```
+
+# 5. Network plot (three granularities)
+```{r network_plot}
+# colours
+treatment_class_colors <- c(
+  "Melatonin-IR" = "#E69F00",
+  "Melatonin-PR" = "#D55E00",
+  "Ashwagandha"  = "#009E73",
+  "Valerian"     = "#0072B2",
+  "Tart-cherry"  = "#CC79A7",
+  "Placebo"      = "grey50"
+)
+
+make_network_plot <- function(data_raw, treatment_col, outcome_name, save_path){
+  data <- data_raw %>% mutate(treatment_base = .data[[treatment_col]])
+  node_map <- data %>% select(treatment_base, treatment_class) %>% distinct()
+  edges <- data %>% group_by(study) %>% filter(n() >= 2) %>%
+    summarise(treatments = list(unique(treatment_base)), .groups = "drop") %>%
+    mutate(pairs = purrr::map(treatments, ~combn(sort(.x), 2, simplify = FALSE))) %>%
+    tidyr::unnest(pairs) %>% mutate(from = map_chr(pairs, 1), to = map_chr(pairs, 2)) %>%
+    count(from, to, name = "weight")
+
+  nodes <- data %>% group_by(treatment_base) %>%
+    summarise(total_n = sum(n), .groups = "drop") %>%
+    left_join(node_map, by = "treatment_base") %>% rename(name = treatment_base)
+
+  net <- tidygraph::tbl_graph(nodes = nodes, edges = edges, directed = FALSE)
+  layout <- ggraph::create_layout(net, layout = "fr")
+  layout_df <- as.data.frame(layout) %>% select(name, x, y)
+  edges_labeled <- edges %>% 
+    left_join(layout_df, by = c("from" = "name")) %>% rename(x_from = x, y_from = y) %>%
+    left_join(layout_df, by = c("to" = "name"))   %>% rename(x_to   = x, y_to   = y) %>%
+    mutate(x = (x_from + x_to)/2, y = (y_from + y_to)/2)
+
+  p <- ggraph(layout) +
+    geom_edge_link(aes(width = weight), colour = "grey70", show.legend = FALSE) +
+    geom_text(data = edges_labeled, aes(x = x, y = y, label = weight), size = 3) +
+    geom_node_point(aes(size = total_n, fill = treatment_class), shape = 21, colour = "black") +
+    geom_node_text(aes(label = name), repel = TRUE, fontface = "bold") +
+    scale_fill_manual(values = treatment_class_colors, na.translate = FALSE) +
+    scale_size(range = c(6, 18)) +
+    theme_void(base_size = 12, base_family = "Arial") +
+    guides(fill = guide_legend(override.aes = list(size = 6))) +
+    labs(title = glue::glue("Network ({treatment_col}) – {outcome_name}"),
+         subtitle = "Node size = total n; edge width = # studies",
+         fill = "Treatment class")
+  print(p)
+  
+  save_figure(p, paste0("network_", treatment_col))  
+  return(p)
+
+  dir.create(save_path, showWarnings = FALSE, recursive = TRUE)
+  ggsave(
+    filename = file.path(save_path, paste0("network_", outcome_name, "_", treatment_col, ".tiff")),
+    plot     = p, width = 8, height = 6, dpi = 600, compression = "lzw"
+  )
+}
+
+out_dir <- fs::path(fs::path_dir(FILE_PATH), "NMA_network_plots", OUTCOME_NAME)
+for (col in c("treatment_class", "treatment_formulation", "treatment")) {
+  make_network_plot(data_raw, col, OUTCOME_NAME, out_dir)
+}
+```
+
+# 6. Bayesian random‑effects NMA (BUGSnet)
+```{r nma_base, results='hide', message=FALSE, warning=FALSE}
+model.re <- nma.model(
+  data      = data_prep,
+  outcome   = "mean",
+  N         = "n",
+  sd        = "sd",
+  reference = REFERENCE_TRT,
+  family    = "normal",
+  link      = "identity",
+  effects   = "random",
+)
+
+results.re <- invisible(nma.run(
+  model     = model.re,
+  n.adapt   = ADAPT,
+  n.burnin  = BURN,
+  n.iter    = ITER,
+  monitor   = c("d", "sigma", "totresdev", "dic", "pD", "resdev", "leverage"),
+  n.chains  = 3,
+  thin      = 10
+))
+```
+
+# 6.1. Bayesian random‑effects NMA - TAU (τ) NOTATION
+```{r nma - I2}
+
+tau_samples <- results.re$samples$BUGSoutput$sims.list$sigma
+tau_summary <- summary(results.re$samples)$quantiles["sigma", c("2.5%", "50%", "97.5%")]
+# Print
+cat(sprintf("Estimated tau (τ): %.3f (95%% CrI: %.3f – %.3f)\n",
+            tau_summary["50%"], tau_summary["2.5%"], tau_summary["97.5%"]))
+
+```
+
+# 6.2. Model diagnostics - Convergence & fit
+```{r diag, fig.cap="Model Diagnostics and Fit Assessment"}
+
+diag_re <- nma.diag(results.re,
+                    trace = TRUE,
+                    gelman.rubin = TRUE,
+                    geweke = TRUE,
+                    plot_prompt = FALSE)
+
+```
+
+# 6.3 Model diagnostics - leverage vs contribution plot
+```{r Contribution (leverage vs contribution plot), fig.cap="Model Diagnostics - leverage vs contribution plot"}
+cat("\n7.2. Model Fit Assessment - Leverage vs Contribution\n")
+invisible(capture.output(
+  nma.fit(results.re, plot.pD = TRUE, plot.DIC = TRUE, plot.Dres = TRUE)
+))
+
+dic_val <- as.numeric(results.re$DIC)
+pd_val <- as.numeric(results.re$pD) 
+
+# For Dres, 
+dres_val <- tryCatch({
+  as.numeric(results.re$summary$all.summary["totresdev", "mean"])
+}, error = function(e) {
+  tryCatch({
+    as.numeric(results.re$summary$all.summary["totresdev", "50%"])
+  }, error = function(e2) {
+    # Fallback: calculate from DIC and pD
+    as.numeric(dic_val - pd_val)
+  })
+})
+
+#title
+rect(xleft = -1.8, ybottom = 4.3, xright = 1.8, ytop = 4.6, 
+     col = rgb(0, 0, 0, 0), border = rgb(0, 0, 0, 0.0), lwd = 1)
+
+text(x = 0, y = 4.45, 
+     labels = paste0("Model Fit: Leverage vs Contribution - ", OUTCOME_NAME), 
+     cex = 1.0, font = 2, adj = 0.5)
+
+# text box
+legend("topleft", 
+       legend = c(paste("pD =", round(pd_val, 1), "complexity"),
+                  paste("Dres =", round(dres_val, 1), "residual dev."),
+                  paste("DIC =", round(dic_val, 1), "model fit"),
+                  "", "Points outside c=3 = poor fit"),
+       bg = "white", box.col = "black", cex = 0.8)
+```
+
+
+# 7. Ranking
+```{r ranking}
+rank_res <- nma.rank(results.re, largerbetter = LARGER_BETTER)
+
+rank_res$sucratable %>% 
+  knitr::kable(caption = "SUCRA table") %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+
+rank_res$sucraplot
+rank_res$rankogram
+#make colour pallet more distinguishable?
+
+saveRDS(rank_res$sucratable, 
+        file.path(OUTPUT_PATH, paste0("sucra_", OUTCOME_NAME, ".rds")))
+
+
+```
+
+
+# 8. Pair‑wise adverse events (table)
+```{r ae}
+data_raw %>% 
+  group_by(treatment_class) %>% 
+  summarise(
+    arms          = n(),
+    mean_ae_rate  = round(mean(ae_rate, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>% 
+  knitr::kable(caption = "Adverse event rates by treatment class") %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+# 8.1 Adverse Event (AE) Rate
+
+```{r ae_network_plot}
+# 14. Adverse Event (AE) Rate Network Plot ------------------------------------
+
+# average AE rate for each treatment class
+ae_node_data <- data_raw %>%
+  group_by(treatment_class) %>%
+  summarise(
+    avg_ae_rate = mean(ae_rate, na.rm = TRUE),
+    total_n = sum(n),
+    .groups = "drop"
+  ) %>%
+  rename(name = treatment_class)
+
+# Define network edges (same as your original network plot)
+ae_edges <- data_raw %>%
+  group_by(study) %>%
+  filter(n() >= 2) %>%
+  summarise(treatments = list(unique(treatment_class)), .groups = "drop") %>%
+  mutate(pairs = purrr::map(treatments, ~combn(sort(.x), 2, simplify = FALSE))) %>%
+  tidyr::unnest(pairs) %>%
+  mutate(from = map_chr(pairs, 1), to = map_chr(pairs, 2)) %>%
+  count(from, to, name = "weight")
+
+# Create the graph object
+ae_net_graph <- tidygraph::tbl_graph(nodes = ae_node_data, edges = ae_edges, directed = FALSE)
+
+# Generate the plot
+ae_plot <- ggraph(ae_net_graph, layout = "fr") +
+  geom_edge_link(aes(width = weight), colour = "grey70", show.legend = FALSE) +
+  geom_node_point(aes(size = avg_ae_rate, fill = name), shape = 21, colour = "black") +
+  geom_node_text(aes(label = name), repel = TRUE, fontface = "bold") +
+  scale_fill_manual(values = treatment_class_colors, name = "Treatment Class") +
+  scale_size(range = c(3, 20), name = "Average AE Rate (%)") +
+  guides(fill = guide_legend(override.aes = list(size = 10))) +
+  theme_void(base_size = 12) +
+  labs(
+    title = glue::glue("Adverse Event Network – {OUTCOME_NAME}"),
+    subtitle = "Node size = average AE rate (%); Edge width = # studies"
+  )
+
+print(ae_plot)
+```
+# 9. Forest plot & league table
+```{r Forest plot & league table}
+# 10. Forest plot & league table ---------------------------------------------
+####import note: subtitle in results uploaded is incorrect for forest plot - it is meean difference not SMD. 
+forest_res  <- nma.forest(results.re,
+                          comparator = REFERENCE_TRT,
+                          central.tdcy = "median",)
+                          
+league_res  <- nma.league(results.re,
+                          central.tdcy = "median",)
+                          
+
+# Add titles directly to the plots
+if("ggplot" %in% class(forest_res)) {
+  forest_plot_titled <- forest_res + 
+    labs(
+      title = paste0("Forest Plot: Treatment Effects vs ", REFERENCE_TRT, " (", OUTCOME_NAME, ")"),
+      subtitle = "Mean Differences with 95% Credible Intervals"
+    ) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5)
+    )
+} else {
+  forest_plot_titled <- forest_res
+}
+
+if("ggplot" %in% class(league_res$heatplot)) {
+  league_plot_titled <- league_res$heatplot + 
+    labs(
+      title = paste0("League Table: All Pairwise Comparisons (", OUTCOME_NAME, ")"),
+      subtitle = "Median posterior estimates with 95% credible intervals"
+    ) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5)
+    )
+} else {
+  league_plot_titled <- league_res$heatplot
+}
+
+# Save high-res versions with embedded titles
+dir.create("fig/nma", showWarnings = FALSE, recursive = TRUE)
+ggsave("fig/nma/forest_plot.tiff", forest_plot_titled, dpi = 600,
+       width = 7, height = 9, compression = "lzw")
+ggsave("fig/nma/league_heat.tiff", league_plot_titled, dpi = 600,
+       width = 8, height = 8, compression = "lzw")
+
+# Display plots with embedded titles
+print(forest_plot_titled)
+print(league_plot_titled)
+
+# Display numerical league table
+league_res$table %>%
+  kableExtra::kable(caption = paste0("League Table: ", OUTCOME_NAME, " – Median Posterior (95% CrI)")) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+save_figure(forest_res, "forest_plot")
+save_figure(league_res$heatplot, "league_heatplot")
+save_table(as.data.frame(league_res$table), "league_table", 
+           paste0("League Table: ", OUTCOME_NAME, " – Median Posterior (95% CrI)"))
+
+saveRDS(league_res$table, 
+        file.path(OUTPUT_PATH, paste0("league_", OUTCOME_NAME, ".rds")))
+
+```
+
+
+# 10. Node-splitting / local inconsistency
+```{r Node-splitting}
+# 11. Node-splitting / local inconsistency ------------------------------------
+cat("11.1. Global Inconsistency Assessment\n")
+invisible(capture.output({
+  inc_model <- nma.model(
+    data      = data_prep,
+    outcome   = "mean", N = "n", sd = "sd",
+    reference = REFERENCE_TRT,
+    family    = "normal", link = "identity",
+    effects   = "random",
+    type      = "inconsistency",
+    prior.sigma = "dunif(0,5)"
+  )
+  
+  inc_fit <- nma.run(
+    model     = inc_model,
+    n.adapt   = ADAPT,
+    n.burnin  = BURN,
+    n.iter    = ITER,
+    thin      = 10,
+    monitor   = c("totresdev", "dic", "pD")
+  )
+}))
+
+consistency_fit    <- nma.fit(results.re)
+cat("Consistency Model Leverage Plot:\n")
+title(main = paste0("Consistency Model: Leverage vs Contribution - ", OUTCOME_NAME),
+      cex.main = 1.1, font.main = 2)
+
+legend("topleft", 
+       legend = c(paste("pD =", round(pd_val, 1), "complexity"),
+                  paste("Dres =", round(dres_val, 1), "residual dev."),
+                  paste("DIC =", round(dic_val, 1), "model fit"),
+                  "", "Points outside c=3 = poor fit"),
+       bg = "white", box.col = "black", cex = 0.8)
+
+
+
+
+
+cat("\nInconsistency Model Leverage Plot:\n")
+inconsistency_fit  <- nma.fit(inc_fit)
+title(main = paste0("Inconsistency Model: Leverage vs Contribution - ", OUTCOME_NAME),
+      cex.main = 1.1, font.main = 2)
+legend("topleft", 
+       legend = c("pD = complexity",
+                  "Dres = residual dev.", 
+                  "DIC = model fit",
+                  "",
+                  "Points outside c=3 = poor fit"),
+       bg = "white", box.col = "black", cex = 0.8)
+
+# comparison plot
+nma.compare(consistency_fit, inconsistency_fit,
+            main = "",)
+              
+
+# custom title with outcome name
+title(main = paste0("Consistency vs Inconsistency Assessment - ", OUTCOME_NAME),
+      cex.main = 1.2, font.main = 2, line = 1)
+
+consistency_dic <- tryCatch({
+  as.numeric(consistency_fit$DIC)
+}, error = function(e) {
+  tryCatch({
+    as.numeric(results.re$DIC)
+  }, error = function(e2) {
+    NA
+  })
+})
+
+inconsistency_dic <- tryCatch({
+  as.numeric(inconsistency_fit$DIC)
+}, error = function(e) {
+  tryCatch({
+    as.numeric(inc_fit$DIC)
+  }, error = function(e2) {
+    NA
+  })
+})
+
+
+# Adding legend box with interpretation
+legend("topleft", 
+       legend = c("Consistency Model vs Inconsistency Model",
+                  "",
+                  "Points on diagonal = no improvement",
+                  "from inconsistency model",
+                  "",
+                  "Points below diagonal = inconsistency", 
+                  "model improves fit for that study"),
+       bg = "white", 
+       box.col = "black", 
+       cex = 0.75,
+       title = "  Interpretation",
+       title.adj = 0)
+
+if (!is.na(consistency_dic) && !is.na(inconsistency_dic)) {
+  dic_diff <- inconsistency_dic - consistency_dic
+  conclusion <- ifelse(dic_diff > 5, "Strong consistency support",
+                ifelse(dic_diff > 2, "Moderate consistency support", 
+                       "No evidence against consistency"))
+
+legend("bottomright",
+       legend = c(paste("Consistency DIC:", round(consistency_dic, 1)),
+                    paste("Inconsistency DIC:", round(inconsistency_dic, 1)),
+                    paste("Difference:", round(dic_diff, 1)),
+                    "",
+                    conclusion),
+         bg = "white",
+         box.col = "black", 
+         cex = 0.75,
+         title = "Model Comparison")
+} else {
+  legend("bottomleft",
+         legend = c("DIC values not accessible",
+                    "Visual assessment only",
+                    "",
+                    "Interpret based on scatter pattern"),
+         bg = "white",
+         box.col = "black", 
+         cex = 0.75,
+         title = "Model Comparison")
+}
+
+cat("Global inconsistency assessment completed using BUGSnet standard method\n")
+
+```
+
+# 11. publication bias
+```{r ca_funnel_fixed, fig.height=6, fig.width=7}
+# publication bias
+# ── Comparison-adjusted funnel (netmeta ▸ meta::pairwise) ──────────────────
+
+## 1. Build a contrast dataset
+pw <- meta::pairwise(
+  treat     = treatment_class,
+  mean      = mean,
+  sd        = sd,
+  n         = n,
+  studlab   = study,
+  data      = data_raw,
+  sm        = "SMD"
+)
+
+## 2. Fit a random-effects NMA
+nm <- netmeta::netmeta(
+  TE              = pw$TE,
+  seTE            = pw$seTE,
+  treat1          = pw$treat1,
+  treat2          = pw$treat2,
+  studlab         = pw$studlab,
+  sm              = "SMD",
+  comb.fixed      = FALSE,
+  comb.random     = TRUE,
+  reference.group = REFERENCE_TRT
+)
+
+## 3. Comparison-adjusted funnel plot
+funnel(
+  nm,
+  order   = nm$trts,
+  contour = c(0.90, 0.95, 0.99), # Corrected line
+  xlab    = "Comparison-adjusted SMD",
+  main = paste0("Comparison-adjusted Funnel Plot - ", OUTCOME_NAME)
+)
+```
+
+
+# 12 SENSITIVITY ANALYSES
+# 12.1 Sensitivity analysis - excl. high-risk
+```{r SA-High-risk ROB RCTs excluded , results='asis'}
+# 17.High-risk ROB RCTs excluded 
+# 1. Filter to exclude high-risk 
+# This creates a new dataframe called 'data_low_rob'
+data_low_rob <- data_raw %>%
+  dplyr::filter(rob != "High_risk")
+
+# check to see how many studies were removed
+cat("Original number of studies:", dplyr::n_distinct(data_raw$study), "\n")
+cat("Number of studies in sensitivity analysis:", dplyr::n_distinct(data_low_rob$study), "\n")
+
+# 2. Prepare the filtered data for BUGSnet
+sens_rob_prep <- invisible(BUGSnet::data.prep(
+  arm.data = data_low_rob,
+  varname.t = "treatment_class",
+  varname.s = "study"
+))
+
+# 3. Define the NMA model for the sensitivity analysis
+sens_rob_model <- BUGSnet::nma.model(
+  data = sens_rob_prep,
+  reference = REFERENCE_TRT,
+  outcome = "mean",
+  N = "n",
+  sd = "sd",
+  family = "normal",
+  link = "identity",
+  effects = "random"
+)
+
+# 4. Run the NMA on the filtered dataset
+sens_rob_results <- BUGSnet::nma.run(
+    sens_rob_model,
+    n.iter = ITER,
+    n.burnin = BURN,
+    n.adapt = ADAPT,
+    n.chains = 3
+)
+
+# 5. Display the league table from the sensitivity analysis for comparison
+cat("\n--- League Table from Sensitivity Analysis (High Risk Studies Excluded) ---\n")
+sens_league_table <- BUGSnet::nma.league(sens_rob_results, central.tdcy = "median")
+
+# Print the table and the plot
+# Create and print the table
+rob_table <- knitr::kable(as.data.frame(sens_league_table$table), 
+                          caption = paste0("ROB Sensitivity Analysis - ", OUTCOME_NAME)) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+print(rob_table)
+print(sens_league_table$heatplot)
+
+# Network plot for high-risk exclusion sensitivity
+treatment_class_colors <- c(
+  "Melatonin-IR" = "#E69F00",
+  "Melatonin-PR" = "#D55E00",
+  "Ashwagandha"  = "#009E73",
+  "Valerian"     = "#0072B2",
+  "Tart-cherry"  = "#CC79A7",
+  "Placebo"      = "grey50"
+)
+
+make_network_plot_rob <- function(data_raw, treatment_col, outcome_name, save_path){
+  data <- data_raw %>% mutate(treatment_base = .data[[treatment_col]])
+  node_map <- data %>% select(treatment_base, treatment_class) %>% distinct()
+  edges <- data %>% group_by(study) %>% filter(n() >= 2) %>%
+    summarise(treatments = list(unique(treatment_base)), .groups = "drop") %>%
+    mutate(pairs = purrr::map(treatments, ~combn(sort(.x), 2, simplify = FALSE))) %>%
+    tidyr::unnest(pairs) %>% mutate(from = map_chr(pairs, 1), to = map_chr(pairs, 2)) %>%
+    count(from, to, name = "weight")
+  nodes <- data %>% group_by(treatment_base) %>%
+    summarise(total_n = sum(n), .groups = "drop") %>%
+    left_join(node_map, by = "treatment_base") %>% rename(name = treatment_base)
+  net <- tidygraph::tbl_graph(nodes = nodes, edges = edges, directed = FALSE)
+  layout <- ggraph::create_layout(net, layout = "fr")
+  layout_df <- as.data.frame(layout) %>% select(name, x, y)
+  edges_labeled <- edges %>% 
+    left_join(layout_df, by = c("from" = "name")) %>% rename(x_from = x, y_from = y) %>%
+    left_join(layout_df, by = c("to" = "name"))   %>% rename(x_to   = x, y_to   = y) %>%
+    mutate(x = (x_from + x_to)/2, y = (y_from + y_to)/2)
+  p <- ggraph(layout) +
+    geom_edge_link(aes(width = weight), colour = "grey70", show.legend = FALSE) +
+    geom_text(data = edges_labeled, aes(x = x, y = y, label = weight), size = 3) +
+    geom_node_point(aes(size = total_n, fill = treatment_class), shape = 21, colour = "black") +
+    geom_node_text(aes(label = name), repel = TRUE, fontface = "bold") +
+    scale_fill_manual(values = treatment_class_colors, na.translate = FALSE) +
+    scale_size(range = c(6, 18)) +
+    theme_void(base_size = 12, base_family = "Arial") +
+    guides(fill = guide_legend(override.aes = list(size = 6))) +
+    labs(title = glue::glue("Network Excluding High-Risk Studies – {outcome_name}"),
+         subtitle = "Node size = total n; edge width = # studies",
+         fill = "Treatment class")
+  print(p)
+  dir.create(save_path, showWarnings = FALSE, recursive = TRUE)
+  ggsave(
+    filename = file.path(save_path, paste0("network_high_risk_excluded_", outcome_name, ".tiff")),
+    plot     = p, width = 8, height = 6, dpi = 600, compression = "lzw"
+  )
+}
+
+out_dir_rob <- fs::path(fs::path_dir(FILE_PATH), "NMA_network_plots", OUTCOME_NAME)
+make_network_plot_rob(data_low_rob, "treatment_class", OUTCOME_NAME, out_dir_rob)
+```
+
+
+
+# 12.2 Sensitivity analysis - Heterogeneity Prior
+```{r SA-Heterogeneity-Prior-Simple}
+# Simple Heterogeneity Prior Sensitivity Analysis
+
+cat("=== SENSITIVITY ANALYSIS: HETEROGENEITY PRIOR ===\n")
+cat("Comparing default prior vs. weakly informative prior: dnorm(0, 0.32)T(0,)\n\n")
+
+# Run sensitivity analysis with different prior - SUPPRESS OUTPUT
+invisible(capture.output({
+  sens_prior_model <- nma.model(
+    data = data_prep,
+    reference = REFERENCE_TRT,
+    outcome = "mean", N = "n", sd = "sd",
+    family = "normal", link = "identity", effects = "random",
+    prior.sigma = "dnorm(0, 0.32)T(0,)"
+  )
+  
+  sens_prior_results <- nma.run(sens_prior_model, n.iter = ITER, n.burnin = BURN, n.adapt = ADAPT, n.chains = 3)
+}))
+
+# Extract tau summaries
+main_tau <- summary(results.re$samples)$quantiles["sigma", c("2.5%", "50%", "97.5%")]
+sens_tau <- summary(sens_prior_results$samples)$quantiles["sigma", c("2.5%", "50%", "97.5%")]
+
+cat("HETEROGENEITY PARAMETER (τ) COMPARISON:\n")
+cat(sprintf("  Original prior:      %.3f (95%% CrI: %.3f – %.3f)\n", 
+            main_tau["50%"], main_tau["2.5%"], main_tau["97.5%"]))
+cat(sprintf("  Informative prior:   %.3f (95%% CrI: %.3f – %.3f)\n", 
+            sens_tau["50%"], sens_tau["2.5%"], sens_tau["97.5%"]))
+cat(sprintf("  Difference:          %.3f\n\n", sens_tau["50%"] - main_tau["50%"]))
+
+# Model fit comparison
+cat(sprintf("MODEL FIT COMPARISON:\n"))
+cat(sprintf("  Original DIC:        %.1f\n", results.re$DIC))
+cat(sprintf("  Informative prior:   %.1f\n", sens_prior_results$DIC))
+cat(sprintf("  Difference:          %.1f\n\n", sens_prior_results$DIC - results.re$DIC))
+
+# Simple interpretation
+max_tau_diff <- abs(sens_tau["50%"] - main_tau["50%"])
+if (max_tau_diff < 0.1) {
+  cat("INTERPRETATION: Results are robust to heterogeneity prior specification\n")
+} else {
+  cat("INTERPRETATION: Results are sensitive to heterogeneity prior specification\n")
+}
+```
+
+
+# 12.3 Sensitivity analysis - excl. cross-over
+```{r SA-cross-over_exclusion}
+# 18. Sensitivity Analysis: Excluding Cross-Over Studies ---------------------
+
+#network plot
+
+
+if (!"design" %in% names(data_raw)) {
+  stop("The 'design' column was not found")
+}
+
+# 1. Filter out studies with a cross-over design
+data_parallel_only <- data_raw %>%
+  dplyr::filter(design != "crossover")
+
+cat("Original number of studies:", dplyr::n_distinct(data_raw$study), "\n")
+cat("Number of studies in parallel-only analysis:", dplyr::n_distinct(data_parallel_only$study), "\n")
+
+# 2. Prepare the filtered data for BUGSnet
+sens_design_prep <- BUGSnet::data.prep(
+  arm.data = data_parallel_only,
+  varname.t = "treatment_class",
+  varname.s = "study"
+)
+
+# 3. Define and run the NMA model on the filtered dataset
+sens_design_model <- BUGSnet::nma.model(
+  data = sens_design_prep,
+  reference = REFERENCE_TRT,
+  outcome = "mean", N = "n", sd = "sd",
+  family = "normal", link = "identity", effects = "random"
+)
+
+sens_design_results <- BUGSnet::nma.run(
+  sens_design_model,
+  n.iter = ITER,
+  n.burnin = BURN,
+  n.adapt = ADAPT,
+  n.chains = 3
+)
+
+# 4. Display the results for comparison
+# League table
+sens_design_league <- BUGSnet::nma.league(sens_design_results, central.tdcy = "median")
+
+knitr::kable(sens_design_league$table, 
+             caption = paste0("Sensitivity Analysis: Excluding Cross-Over Studies (", OUTCOME_NAME, ")")) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+```
+
+
+# 12.4 Sensitivity analysis - corr 0.2/0.8 impute
+```{r correlation_sensitivity}
+run_correlation_sensitivity <- function(data_raw) {
+  
+  results_list <- list()
+  
+  # Define scenarios - FIXED column names
+  scenarios <- list(
+    "Primary (r=0.5)" = list(sd_col = "sd", n_col = "n"),
+    "Low correlation (r=0.2)" = list(sd_col = "sd_r0.2", n_col = "n"),  # Fixed name
+    "High correlation (r=0.8)" = list(sd_col = "sd_r0.8", n_col = "n")  # Fixed name
+  )
+  
+  for (scenario_name in names(scenarios)) {
+    cat("\nRunning", scenario_name, "analysis...\n")
+    
+    # Prepare data with appropriate SD column
+    temp_data <- data_raw %>%
+      dplyr::mutate(
+        sd = .data[[scenarios[[scenario_name]]$sd_col]],
+        n = .data[[scenarios[[scenario_name]]$n_col]]
+      )
+    
+    # Run NMA - SUPPRESS OUTPUT
+    invisible(capture.output({
+      temp_prep <- BUGSnet::data.prep(
+        arm.data = temp_data,
+        varname.t = "treatment_class",
+        varname.s = "study"
+      )
+      
+      temp_model <- BUGSnet::nma.model(
+        data = temp_prep,
+        reference = REFERENCE_TRT,
+        outcome = "mean", N = "n", sd = "sd",
+        family = "normal", link = "identity", 
+        effects = "random"
+      )
+      
+      temp_results <- BUGSnet::nma.run(
+        temp_model,
+        n.iter = ITER, n.burnin = BURN, 
+        n.adapt = ADAPT, n.chains = 3
+      )
+    }))
+    
+    # Extract results
+    results_list[[scenario_name]] <- temp_results
+  }
+  
+  return(results_list)
+}
+
+# ACTUALLY RUN THE FUNCTION
+corr_results <- run_correlation_sensitivity(data_raw)
+
+# DISPLAY RESULTS
+if (length(corr_results) > 0) {
+  cat("\nCORRELATION SENSITIVITY RESULTS\n")
+  
+  for (scenario in names(corr_results)) {
+    cat("\n", scenario, ":\n")
+    league_table <- BUGSnet::nma.league(corr_results[[scenario]], central.tdcy = "median")
+    print(league_table$table)
+  }
+}
+```
+
+
+
+
+# 12.5 Sensitivity analysis - incl. Magnesium
+```{r magnesium_sensitivity-one more}
+cat("\n\nSENSITIVITY ANALYSIS: INCLUDING MAGNESIUM TRIAL\n")
+cat("Analyzing outcome:", OUTCOME_NAME, "\n\n")
+
+# Initialize empty table
+mag_sensitivity_table <- data.frame()
+
+tryCatch({
+  # Load the magnesium data
+  magnesium_data_all <- readxl::read_excel(
+    FILE_PATH, 
+    sheet = "Magnesium_Trial"  # Adjust sheet name as needed
+  )
+  
+  # Filter for the specific outcome
+  magnesium_data <- magnesium_data_all %>%
+    dplyr::filter(outcome == OUTCOME_NAME)
+  
+  cat("Magnesium trial data for", OUTCOME_NAME, ":\n")
+  cat("- Studies:", unique(magnesium_data$study), "\n")
+  cat("- Treatments:", unique(magnesium_data$treatment_class), "\n")
+  cat("- Sample sizes:", paste(magnesium_data$n, collapse = ", "), "\n")
+  cat("- Number of arms:", nrow(magnesium_data), "\n\n")
+  
+  # Check if we have data for this outcome
+  if (nrow(magnesium_data) == 0) {
+    cat("WARNING: No magnesium data found for outcome", OUTCOME_NAME, "\n")
+    cat("Available outcomes in magnesium data:", 
+        unique(magnesium_data_all$outcome), "\n")
+  } else {
+    # Combine with main data
+    data_with_magnesium <- dplyr::bind_rows(
+      data_raw,         # Original data
+      magnesium_data    # Magnesium data for this outcome
+    )
+    
+    # Generate network plot for magnesium sensitivity
+cat("=== Network Plot with Magnesium ===\n")
+
+# Updated colors to include Magnesium
+treatment_class_colors_mag <- c(
+  "Melatonin-IR" = "#E69F00",
+  "Melatonin-PR" = "#D55E00",
+  "Ashwagandha"  = "#009E73",
+  "Valerian"     = "#0072B2",
+  "Tart-cherry"  = "#CC79A7",
+  "Magnesium"    = "#9932CC",
+  "Placebo"      = "grey50"
+)
+
+# Network plot function (identical to main + magnesium)
+make_network_plot_mag <- function(data_raw, treatment_col, outcome_name, save_path){
+  data <- data_raw %>% mutate(treatment_base = .data[[treatment_col]])
+  node_map <- data %>% select(treatment_base, treatment_class) %>% distinct()
+  edges <- data %>% group_by(study) %>% filter(n() >= 2) %>%
+    summarise(treatments = list(unique(treatment_base)), .groups = "drop") %>%
+    mutate(pairs = purrr::map(treatments, ~combn(sort(.x), 2, simplify = FALSE))) %>%
+    tidyr::unnest(pairs) %>% mutate(from = map_chr(pairs, 1), to = map_chr(pairs, 2)) %>%
+    count(from, to, name = "weight")
+  nodes <- data %>% group_by(treatment_base) %>%
+    summarise(total_n = sum(n), .groups = "drop") %>%
+    left_join(node_map, by = "treatment_base") %>% rename(name = treatment_base)
+  net <- tidygraph::tbl_graph(nodes = nodes, edges = edges, directed = FALSE)
+  layout <- ggraph::create_layout(net, layout = "fr")
+  layout_df <- as.data.frame(layout) %>% select(name, x, y)
+  edges_labeled <- edges %>% 
+    left_join(layout_df, by = c("from" = "name")) %>% rename(x_from = x, y_from = y) %>%
+    left_join(layout_df, by = c("to" = "name"))   %>% rename(x_to   = x, y_to   = y) %>%
+    mutate(x = (x_from + x_to)/2, y = (y_from + y_to)/2)
+  p <- ggraph(layout) +
+    geom_edge_link(aes(width = weight), colour = "grey70", show.legend = FALSE) +
+    geom_text(data = edges_labeled, aes(x = x, y = y, label = weight), size = 3) +
+    geom_node_point(aes(size = total_n, fill = treatment_class), shape = 21, colour = "black") +
+    geom_node_text(aes(label = name), repel = TRUE, fontface = "bold") +
+    scale_fill_manual(values = treatment_class_colors_mag, na.translate = FALSE) +
+    scale_size(range = c(6, 18)) +
+    theme_void(base_size = 12, base_family = "Arial") +
+    guides(fill = guide_legend(override.aes = list(size = 6))) +
+    labs(title = glue::glue("Network with Magnesium – {outcome_name}"),
+         subtitle = "Node size = total n; edge width = # studies",
+         fill = "Treatment class")
+  print(p)
+  dir.create(save_path, showWarnings = FALSE, recursive = TRUE)
+  ggsave(
+    filename = file.path(save_path, paste0("network_magnesium_", outcome_name, ".tiff")),
+    plot     = p, width = 8, height = 6, dpi = 600, compression = "lzw"
+  )
+}
+
+out_dir_mag <- fs::path(fs::path_dir(FILE_PATH), "NMA_network_plots", OUTCOME_NAME)
+make_network_plot_mag(data_with_magnesium, "treatment_class", OUTCOME_NAME, out_dir_mag)
+    
+    cat("Combined dataset summary:\n")
+    cat("- Original studies:", dplyr::n_distinct(data_raw$study), "\n")
+    cat("- Added magnesium studies:", dplyr::n_distinct(magnesium_data$study), "\n")
+    cat("- Total studies:", dplyr::n_distinct(data_with_magnesium$study), "\n\n")
+    
+    # Run NMA with magnesium included - SUPPRESS OUTPUT
+    invisible(capture.output({
+      mag_sens_prep <- BUGSnet::data.prep(
+        arm.data = data_with_magnesium,
+        varname.t = "treatment_class",
+        varname.s = "study"
+      )
+      
+      mag_sens_model <- BUGSnet::nma.model(
+        data = mag_sens_prep,
+        reference = REFERENCE_TRT,
+        outcome = "mean",
+        N = "n",
+        sd = "sd",
+        family = "normal",
+        link = "identity",
+        effects = "random"
+      )
+      
+      mag_sens_results <- BUGSnet::nma.run(
+        mag_sens_model,
+        n.iter = ITER,
+        n.burnin = BURN,
+        n.adapt = ADAPT,
+        n.chains = 3
+      )
+    }))
+    
+    cat("Magnesium Sensitivity Results\n")
+    mag_league_table <- BUGSnet::nma.league(mag_sens_results, central.tdcy = "median")
+    print(mag_league_table$table)
+    
+    # Also try forest plot
+    tryCatch({
+      mag_forest <- BUGSnet::nma.forest(mag_sens_results, comparator = REFERENCE_TRT)
+      print(mag_forest)
+    }, error = function(e) {
+      cat("Forest plot not available\n")
+    })
+  }
+  
+}, error = function(e) {
+  cat("Error in magnesium sensitivity analysis:", e$message, "\n")
+})
+```
+
+# 13. Extract Summary Results for Consolidation
+```{r extract_summary_results}
+# Function to extract key results
+extract_analysis_results <- function(results, analysis_name, data_used) {
+  
+  # Get league table
+  league <- BUGSnet::nma.league(results, central.tdcy = "median")
+  
+  # Extract effects vs reference (using your REFERENCE_TRT variable)
+  placebo_effects <- tryCatch({
+    league$table[, REFERENCE_TRT]  # Use your reference variable
+  }, error = function(e) {
+    # If column doesn't exist, try "Placebo"
+    league$table[, "Placebo"]
+  })
+  
+  # Get tau
+  tau_summary <- summary(results$samples)$quantiles["sigma", c("2.5%", "50%", "97.5%")]
+  
+  # Get SUCRA (using your largerbetter setting)
+  rank_res <- BUGSnet::nma.rank(results, largerbetter = LARGER_BETTER)  # Match section 8
+  
+  # Get DIC safely
+  dic_value <- tryCatch({
+    as.numeric(results$DIC)
+  }, error = function(e) {
+    NA
+  })
+  
+  # Create summary list
+  summary_data <- list(
+    outcome = OUTCOME_NAME,
+    analysis = analysis_name,
+    n_studies = dplyr::n_distinct(data_used$study),
+    n_patients = sum(data_used$n),
+    tau_median = tau_summary["50%"],
+    tau_lower = tau_summary["2.5%"],
+    tau_upper = tau_summary["97.5%"],
+    dic = dic_value,
+    effects_vs_placebo = placebo_effects,
+    sucra = rank_res$sucratable
+  )
+  
+  return(summary_data)
+}
+
+# Collect all results - with error handling
+all_analyses <- list()
+
+# Base case (always exists)
+all_analyses[["base_case"]] <- extract_analysis_results(results.re, "Base case", data_raw)
+
+# ROB sensitivity (check if exists)
+if (exists("sens_rob_results") && exists("data_low_rob")) {
+  tryCatch({
+    all_analyses[["sens_rob"]] <- extract_analysis_results(
+      sens_rob_results, "Excl. high risk", data_low_rob
+    )
+  }, error = function(e) {
+    cat("ROB sensitivity extraction failed:", e$message, "\n")
+  })
+}
+
+# Design sensitivity (check if exists)
+if (exists("sens_design_results") && exists("data_parallel_only")) {
+  tryCatch({
+    all_analyses[["sens_design"]] <- extract_analysis_results(
+      sens_design_results, "Excl. crossover", data_parallel_only
+    )
+  }, error = function(e) {
+    cat("Design sensitivity extraction failed:", e$message, "\n")
+  })
+}
+
+# Prior sensitivity (add this since you have section 17.2)
+if (exists("sens_prior_results")) {
+  tryCatch({
+    all_analyses[["sens_prior"]] <- extract_analysis_results(
+      sens_prior_results, "Informative prior", data_raw
+    )
+  }, error = function(e) {
+    cat("Prior sensitivity extraction failed:", e$message, "\n")
+  })
+}
+
+# Correlation sensitivity (check if exists)
+if (exists("corr_results") && length(corr_results) > 0) {
+  for (name in names(corr_results)) {
+    tryCatch({
+      clean_name <- gsub("[()]", "", gsub("=", "", name))  # Clean name for list
+      all_analyses[[paste0("sens_corr_", clean_name)]] <- extract_analysis_results(
+        corr_results[[name]], name, data_raw
+      )
+    }, error = function(e) {
+      cat("Correlation sensitivity", name, "extraction failed:", e$message, "\n")
+    })
+  }
+}
+
+# Magnesium sensitivity (check if exists)
+if (exists("mag_sens_results") && exists("data_with_magnesium")) {
+  tryCatch({
+    all_analyses[["sens_magnesium"]] <- extract_analysis_results(
+      mag_sens_results, "Incl. magnesium", data_with_magnesium
+    )
+  }, error = function(e) {
+    cat("Magnesium sensitivity extraction failed:", e$message, "\n")
+  })
+}
+
+# Create output directory if it doesn't exist
+dir.create(OUTPUT_PATH, recursive = TRUE, showWarnings = FALSE)
+
+# Save summary for consolidation
+saveRDS(all_analyses, 
+        file = file.path(OUTPUT_PATH, paste0("summary_", OUTCOME_NAME, ".rds")))
+
+cat("\nSummary results saved for consolidation\n")
+cat("Analyses included:", paste(names(all_analyses), collapse = ", "), "\n")
+cat("File saved to:", file.path(OUTPUT_PATH, paste0("summary_", OUTCOME_NAME, ".rds")), "\n")
+```
+
+# 19. ENHANCED Extract Summary Results for Publication
+```{r enhanced_extraction}
+cat("\n=== Starting ENHANCED extraction for publication materials ===\n")
+
+# Create enhanced output directory
+ENHANCED_PATH <- file.path(OUTPUT_PATH, "enhanced")
+dir.create(ENHANCED_PATH, recursive = TRUE, showWarnings = FALSE)
+
+# Enhanced extraction function with error handling
+extract_enhanced_results <- function(results, analysis_name, data_used) {
+  
+  cat("  Extracting enhanced data for:", analysis_name, "...\n")
+  
+  # 1. Full posterior samples
+  tau_samples <- results$samples$BUGSoutput$sims.list$sigma
+  
+  # Get d (treatment effect) samples if available
+  d_samples <- tryCatch({
+    results$samples$BUGSoutput$sims.list$d
+  }, error = function(e) NULL)
+  
+  # 2. Detailed model diagnostics
+  diagnostics <- list(
+    DIC = tryCatch(as.numeric(results$DIC), error = function(e) NA),
+    pD = tryCatch(as.numeric(results$pD), error = function(e) NA),
+    Rhat = tryCatch({
+      summary(results$samples)$psrf
+    }, error = function(e) NULL),
+    n_eff = tryCatch({
+      results$samples$BUGSoutput$summary[, "n.eff"]
+    }, error = function(e) NULL)
+  )
+  
+  # 3. Study-level detailed information - WITH COLUMN CHECKING
+  study_details <- tryCatch({
+    # Check which columns exist
+    available_cols <- names(data_used)
+    
+    # Base summary that should always work
+    base_summary <- data_used %>%
+      group_by(study) %>%
+      summarise(
+        n_arms = n(),
+        total_n = sum(n),
+        treatments = paste(unique(treatment_class), collapse = " vs "),
+        .groups = "drop"
+      )
+    
+    # Add optional columns if they exist
+    if ("age" %in% available_cols) {
+      base_summary$mean_age <- data_used %>%
+        group_by(study) %>%
+        summarise(mean_age = weighted.mean(age, n, na.rm = TRUE), .groups = "drop") %>%
+        pull(mean_age)
+    }
+    
+    if ("female_percent" %in% available_cols) {
+      base_summary$female_pct <- data_used %>%
+        group_by(study) %>%
+        summarise(female_pct = weighted.mean(female_percent, n, na.rm = TRUE), .groups = "drop") %>%
+        pull(female_pct)
+    }
+    
+    if ("year" %in% available_cols) {
+      base_summary$year <- data_used %>%
+        group_by(study) %>%
+        summarise(year = first(year), .groups = "drop") %>%
+        pull(year)
+    }
+    
+    if ("country" %in% available_cols) {
+      base_summary$country <- data_used %>%
+        group_by(study) %>%
+        summarise(country = first(country), .groups = "drop") %>%
+        pull(country)
+    }
+    
+    if ("design" %in% available_cols) {
+      base_summary$design <- data_used %>%
+        group_by(study) %>%
+        summarise(design = first(design), .groups = "drop") %>%
+        pull(design)
+    }
+    
+    if ("rob" %in% available_cols) {
+      base_summary$rob <- data_used %>%
+        group_by(study) %>%
+        summarise(rob = first(rob), .groups = "drop") %>%
+        pull(rob)
+    }
+    
+    if ("duration" %in% available_cols) {
+      base_summary$duration <- data_used %>%
+        group_by(study) %>%
+        summarise(duration = first(duration), .groups = "drop") %>%
+        pull(duration)
+    }
+    
+    base_summary
+    
+  }, error = function(e) {
+    cat("    Warning: Could not extract full study details -", e$message, "\n")
+    # Return minimal summary
+    data_used %>%
+      group_by(study) %>%
+      summarise(
+        n_arms = n(),
+        total_n = sum(n),
+        .groups = "drop"
+      )
+  })
+  
+  # 4. Treatment-level summaries - WITH ERROR HANDLING
+  treatment_summary <- tryCatch({
+    base_treat <- data_used %>%
+      group_by(treatment_class) %>%
+      summarise(
+        n_studies = n_distinct(study),
+        n_patients = sum(n),
+        .groups = "drop"
+      )
+    
+    # Add dose info if available
+    if ("dose" %in% names(data_used)) {
+      base_treat$mean_dose <- data_used %>%
+        group_by(treatment_class) %>%
+        summarise(mean_dose = mean(dose, na.rm = TRUE), .groups = "drop") %>%
+        pull(mean_dose)
+      
+      base_treat$dose_range <- data_used %>%
+        group_by(treatment_class) %>%
+        summarise(dose_range = paste(range(dose, na.rm = TRUE), collapse = "-"), .groups = "drop") %>%
+        pull(dose_range)
+    }
+    
+    base_treat
+    
+  }, error = function(e) {
+    cat("    Warning: Limited treatment summary -", e$message, "\n")
+    data_used %>%
+      group_by(treatment_class) %>%
+      summarise(
+        n_studies = n_distinct(study),
+        n_patients = sum(n),
+        .groups = "drop"
+      )
+  })
+  
+  # 5. Pairwise comparisons (all vs all)
+  league_full <- BUGSnet::nma.league(results, central.tdcy = "median")
+  
+  # 6. Ranking probabilities (full rankogram)
+  rank_res <- BUGSnet::nma.rank(results, largerbetter = TRUE)
+  
+  # 7. Network meta-regression data (if covariates available)
+  covariate_data <- tryCatch({
+    available_covars <- intersect(names(data_used), 
+                                 c("age", "female_percent", "duration", "year"))
+    
+    if (length(available_covars) > 0) {
+      data_used %>%
+        select(all_of(c("study", "treatment_class", available_covars))) %>%
+        group_by(treatment_class) %>%
+        summarise(across(all_of(available_covars), 
+                        list(mean = ~mean(., na.rm = TRUE),
+                             sd = ~sd(., na.rm = TRUE))),
+                  .groups = "drop")
+    } else {
+      NULL
+    }
+  }, error = function(e) NULL)
+  
+  # Create enhanced summary
+  enhanced_data <- list(
+    analysis = analysis_name,
+    outcome = OUTCOME_NAME,
+    
+    # Posterior distributions
+    posteriors = list(
+      tau = tau_samples,
+      d = d_samples
+    ),
+    
+    # Model diagnostics
+    diagnostics = diagnostics,
+    
+    # Study information
+    study_details = study_details,
+    treatment_summary = treatment_summary,
+    
+    # Full results
+    league_full = league_full,
+    rankogram = rank_res$rankogram,
+    sucra_raw = rank_res$sucratable,
+    
+    # Covariate data
+    covariates = covariate_data,
+    
+    # Data availability
+    available_columns = names(data_used),
+    
+    # Timestamp
+    extraction_date = Sys.Date()
+  )
+  
+  return(enhanced_data)
+}
+
+# [Rest of the code remains the same - extract for all analyses and save]
+
+# Extract enhanced data for all analyses
+enhanced_analyses <- list()
+
+# Base case
+if (exists("results.re")) {
+  enhanced_analyses$base_case <- extract_enhanced_results(
+    results.re, "Base case", data_raw
+  )
+}
+
+# [Continue with other sensitivity analyses as before...]
+
+# Save enhanced data
+saveRDS(enhanced_analyses,
+        file.path(ENHANCED_PATH, paste0("enhanced_", OUTCOME_NAME, ".rds")))
+
+cat("\nEnhanced extraction completed!\n")
+cat("Available columns in data:", paste(names(data_raw), collapse = ", "), "\n")

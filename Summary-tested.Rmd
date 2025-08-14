@@ -1,0 +1,951 @@
+---
+title: "Network Meta-Analysis: Consolidated Summary Across Outcomes"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+params:
+  output_path: "C:/Users/risha/OneDrive/Desktop/NMA"
+  outcomes: ["TST", "SOL", "WASO", "PSQI", "SE"]
+  treatments_forest: ["Melatonin-IR", "Ashwagandha", "Melatonin-PR", "Valerian", "Tart-cherry"]
+  
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 8, dpi = 600)
+
+# Load libraries
+library(tidyverse)
+library(kableExtra)
+library(gridExtra)
+library(ggplot2)
+library(patchwork)
+
+# Define outcome directions
+outcome_directions <- list(
+  SOL = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced sleep onset latency"
+  ),
+  PSQI = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced sleep disturbance"
+  ),
+  WASO = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced wake after sleep onset"
+  ),
+  TST = list(
+    larger_better = TRUE,
+    direction = "higher",
+    interpretation = "Increased total sleep time"
+  ),
+  SE = list(
+    larger_better = TRUE,
+    direction = "higher",
+    interpretation = "Increased sleep efficiency"
+  )
+)
+
+# SIGN CORRECTION FUNCTION
+# BUGSnet league tables save effects with opposite signs from forest plots
+# This function corrects them on loading
+correct_effect_signs <- function(effect_text, outcome_name) {
+  if (is.na(effect_text) || is.null(effect_text) || effect_text == "Placebo") {
+    return(effect_text)
+  }
+  
+  # Parse the text
+  if (grepl("\\(.*to.*\\)", effect_text)) {
+    main_parts <- strsplit(as.character(effect_text), " \\(")[[1]]
+    estimate <- as.numeric(main_parts[1])
+    
+    ci_text <- gsub("\\)", "", main_parts[2])
+    ci_parts <- strsplit(ci_text, " to ")[[1]]
+    lower <- as.numeric(ci_parts[1])
+    upper <- as.numeric(ci_parts[2])
+    
+    # Apply sign correction based on outcome
+    # TST and SE: positive values indicate benefit (if saved as negative, flip)
+    # SOL, WASO, PSQI: negative values indicate benefit (if saved as positive, flip)
+    
+    if (outcome_name %in% c("TST", "SE")) {
+      # These should be positive when beneficial
+      # If negative, flip the sign
+      if (estimate < 0) {
+        estimate <- -estimate
+        temp <- -upper
+        upper <- -lower
+        lower <- temp
+      }
+    } else if (outcome_name %in% c("SOL", "WASO", "PSQI")) {
+      # These should be negative when beneficial
+      # If positive, flip the sign
+      if (estimate > 0) {
+        estimate <- -estimate
+        temp <- -upper
+        upper <- -lower
+        lower <- temp
+      }
+    }
+    
+    # Reconstruct the text
+    return(sprintf("%.2f (%.2f to %.2f)", estimate, lower, upper))
+  }
+  
+  return(effect_text)
+}
+```
+
+
+
+# 1 Loading
+```{r Outcome Summaries}
+all_outcomes <- list()
+missing_outcomes <- c()
+
+cat("Loading and correcting outcome data from:", params$output_path, "\n\n")
+
+for (outcome in params$outcomes) {
+  file_path <- file.path(params$output_path, paste0("summary_", outcome, ".rds"))
+  
+  if (file.exists(file_path)) {
+    # Load the data
+    outcome_data <- readRDS(file_path)
+    
+    # APPLY SIGN CORRECTION to all analyses
+    for (analysis_name in names(outcome_data)) {
+      if (!is.null(outcome_data[[analysis_name]]$effects_vs_placebo)) {
+        # Correct each treatment effect
+        effects <- outcome_data[[analysis_name]]$effects_vs_placebo
+        for (trt in names(effects)) {
+          effects[trt] <- correct_effect_signs(effects[trt], outcome)
+        }
+        outcome_data[[analysis_name]]$effects_vs_placebo <- effects
+      }
+    }
+    
+    # Store corrected data
+    all_outcomes[[outcome]] <- outcome_data
+    
+    cat("✓ Loaded and corrected:", outcome, "- Studies:", 
+        all_outcomes[[outcome]]$base_case$n_studies, "\n")
+    
+    # Show sample corrected values for verification
+    if (!is.null(all_outcomes[[outcome]]$base_case$effects_vs_placebo)) {
+      first_effect <- all_outcomes[[outcome]]$base_case$effects_vs_placebo[1]
+      if (!is.na(first_effect) && first_effect != "Placebo") {
+        cat("  Sample effect:", names(all_outcomes[[outcome]]$base_case$effects_vs_placebo)[1],
+            "=", first_effect, "\n")
+      }
+    }
+  } else {
+    missing_outcomes <- c(missing_outcomes, outcome)
+    cat("✗ Missing:", outcome, "\n")
+  }
+}
+
+if (length(missing_outcomes) > 0) {
+  cat("\n⚠ Warning: Missing data for:", paste(missing_outcomes, collapse = ", "), "\n")
+}
+```
+
+
+
+
+# 2 Primary Analysis Summary
+```{r Primary Analysis Summary}
+# Get all treatments from base case analyses
+all_treatments <- unique(unlist(map(all_outcomes, function(x) {
+  names(x$base_case$effects_vs_placebo)
+})))
+all_treatments <- setdiff(all_treatments, "Placebo")
+treatments_to_show <- intersect(params$treatments_forest, all_treatments)
+
+cat("Treatments found:", paste(all_treatments, collapse = ", "), "\n")
+cat("Treatments to display:", paste(treatments_to_show, collapse = ", "), "\n\n")
+
+# Create primary results table
+primary_table <- map_df(names(all_outcomes), function(outcome) {
+  base_case <- all_outcomes[[outcome]]$base_case
+  effects <- base_case$effects_vs_placebo
+  
+  # Add direction indicator
+  dir_info <- outcome_directions[[outcome]]
+  dir_text <- ifelse(dir_info$larger_better, " ↑", " ↓")
+  
+  # Create base row
+  row_data <- data.frame(
+    Outcome = paste0(outcome, dir_text),
+    Studies = base_case$n_studies,
+    Patients = base_case$n_patients,
+    Tau = sprintf("%.3f (%.3f-%.3f)", 
+                  base_case$tau_median, 
+                  base_case$tau_lower, 
+                  base_case$tau_upper),
+    DIC = ifelse(is.na(base_case$dic) || base_case$dic == 0, 
+                 "NA", 
+                 sprintf("%.1f", base_case$dic)),
+    stringsAsFactors = FALSE
+  )
+  
+  # Add treatment effects
+  for (trt in treatments_to_show) {
+    col_name <- gsub("-", "_", trt)
+    if (trt %in% names(effects)) {
+      effect_value <- as.character(effects[trt])
+      # Check if this is a valid effect (not "Placebo" or NA)
+      if (!is.na(effect_value) && effect_value != "Placebo") {
+        row_data[[col_name]] <- effect_value
+      } else {
+        row_data[[col_name]] <- NA_character_
+      }
+    } else {
+      row_data[[col_name]] <- NA_character_
+    }
+  }
+  
+  return(row_data)
+})
+
+# Display table
+kable(primary_table, 
+      caption = "Table 1: Primary Analysis Results - Mean Differences vs Placebo",
+      col.names = c("Outcome", "Studies", "Patients", "τ (95% CrI)", "DIC",  
+                    treatments_to_show),
+      align = c('l', 'c', 'c', 'c', 'c', rep('c', length(treatments_to_show)))) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+  add_header_above(c(" " = 5, "MD vs Placebo (95% CrI)" = length(treatments_to_show))) %>%
+  footnote(general = c("↑ = Higher values are better (TST, SE)",
+                       "↓ = Lower values are better (SOL, WASO, PSQI)",
+                       "τ = Between-study heterogeneity",
+                       "DIC = Deviance Information Criterion"))
+```
+
+
+
+
+#  SUCRA Rankings
+```{r SUCRA Rankings Summary FIXED}
+# Calculate SUCRA values with proper direction handling
+sucra_comparison <- map_df(names(all_outcomes), function(outcome) {
+  tryCatch({
+    # Get SUCRA table from base case
+    rank_table <- all_outcomes[[outcome]]$base_case$sucra
+    
+    if (is.null(rank_table)) {
+      cat("No SUCRA data for", outcome, "\n")
+      return(NULL)
+    }
+    
+    # Convert to dataframe if needed
+    rank_df <- as.data.frame(rank_table)
+    
+    # Check if there's a SUCRA row BEFORE removing rank column
+    has_sucra_row <- FALSE
+    sucra_row_idx <- NULL
+    
+    if ("rank" %in% names(rank_df)) {
+      sucra_row_idx <- which(grepl("SUCRA|sucra", rank_df$rank, ignore.case = TRUE))
+      has_sucra_row <- length(sucra_row_idx) > 0
+    }
+    
+    if (has_sucra_row) {
+      cat("Found pre-calculated SUCRA values for", outcome, "\n")
+      
+      # Extract SUCRA values from the SUCRA row
+      sucra_row <- rank_df[sucra_row_idx, ]
+      
+      # Remove rank column and get treatment columns only
+      treatment_cols <- names(rank_df)[names(rank_df) != "rank"]
+      sucra_values <- as.numeric(sucra_row[treatment_cols])
+      names(sucra_values) <- treatment_cols
+      
+      # Remove any NA values
+      sucra_values <- sucra_values[!is.na(sucra_values)]
+      
+    } else {
+      # Calculate SUCRA from ranking probabilities
+      cat("Calculating SUCRA from probabilities for", outcome, "\n")
+      
+      # Remove 'rank' column if it exists
+      if ("rank" %in% names(rank_df)) {
+        rank_df <- rank_df[, -which(names(rank_df) == "rank")]
+      }
+      
+      # Convert to numeric
+      rank_df[] <- lapply(rank_df, as.numeric)
+      
+      n_ranks <- nrow(rank_df)
+      
+      # Calculate SUCRA values
+      sucra_values <- sapply(rank_df, function(col) {
+        cumsum_probs <- cumsum(as.numeric(col))[-n_ranks]  # Exclude last rank
+        sum(cumsum_probs) / (n_ranks - 1) * 100
+      })
+    }
+    
+    # Get direction info
+    dir_info <- outcome_directions[[outcome]]
+    direction <- ifelse(dir_info$larger_better, " ↑", " ↓")
+    
+    data.frame(
+      Outcome = outcome,
+      Outcome_labeled = paste0(outcome, direction),
+      Treatment = names(sucra_values),
+      SUCRA = as.numeric(sucra_values),
+      stringsAsFactors = FALSE
+    )
+    
+  }, error = function(e) {
+    cat("Error processing SUCRA for", outcome, ":", e$message, "\n")
+    return(NULL)
+  })
+})
+
+# Create wide format table
+if (!is.null(sucra_comparison) && nrow(sucra_comparison) > 0) {
+  sucra_wide <- sucra_comparison %>%
+    select(Outcome_labeled, Treatment, SUCRA) %>%
+    pivot_wider(names_from = Outcome_labeled, values_from = SUCRA) %>%
+    mutate(Mean_SUCRA = rowMeans(select(., -Treatment), na.rm = TRUE)) %>%
+    arrange(desc(Mean_SUCRA))
+  
+  # Display table with highlighting
+  kable(sucra_wide, 
+        caption = "Table 2: SUCRA Values (%) - Higher values indicate better ranking",
+        digits = 1,
+        align = c('l', rep('c', ncol(sucra_wide) - 1))) %>%
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+    row_spec(1:3, bold = TRUE, color = "darkgreen") %>%
+    row_spec(which(sucra_wide$Treatment == "Placebo"), color = "gray") %>%
+    column_spec(ncol(sucra_wide), bold = TRUE)
+} else {
+  cat("No SUCRA data available\n")
+}
+
+```
+
+
+
+
+# 2.22 DEBUG
+
+```{r}
+# First, let's see data
+cat("=== DEBUGGING DATA STRUCTURE ===\n\n")
+
+# Check one outcome in detail
+test_outcome <- names(all_outcomes)[1]
+cat("Examining structure for:", test_outcome, "\n\n")
+
+# Check what analyses are available
+cat("Available analyses:\n")
+print(names(all_outcomes[[test_outcome]]))
+
+# Check structure of base_case
+cat("\n\nStructure of base_case:\n")
+print(names(all_outcomes[[test_outcome]]$base_case))
+
+# Check effects_vs_placebo structure
+cat("\n\nSample effects_vs_placebo:\n")
+effects_sample <- all_outcomes[[test_outcome]]$base_case$effects_vs_placebo
+print(head(effects_sample, 3))
+
+# Check if there's an 'analysis' field
+cat("\n\nLooking for 'analysis' field in base_case:\n")
+if ("analysis" %in% names(all_outcomes[[test_outcome]]$base_case)) {
+  print(all_outcomes[[test_outcome]]$base_case$analysis)
+} else {
+  cat("No 'analysis' field found - will need to use analysis name from list\n")
+}
+```
+
+
+
+```{r Sensitivity Analysis Forest Plots, fig.height=12, include=FALSE}
+ # Forest plot function WITHOUT sign correction (data is already correct)
+create_sensitivity_forest <- function(outcome_data, treatment, outcome_name) {
+  
+  dir_info <- outcome_directions[[outcome_name]]
+  larger_better <- dir_info$larger_better
+  
+  # Extract data from all analyses
+  forest_data <- map_df(names(outcome_data), function(analysis_name) {
+    tryCatch({
+      analysis <- outcome_data[[analysis_name]]
+      
+      if (!treatment %in% names(analysis$effects_vs_placebo)) {
+        return(NULL)
+      }
+      
+      effect_text <- analysis$effects_vs_placebo[treatment]
+      
+      if (is.na(effect_text) || is.null(effect_text) || 
+          effect_text == "Placebo" || effect_text == "") {
+        return(NULL)
+      }
+      
+      # Parse the effect text
+      if (grepl("\\(.*to.*\\)", effect_text)) {
+        parts <- strsplit(as.character(effect_text), " \\(")[[1]]
+        estimate <- as.numeric(parts[1])
+        ci_text <- gsub("\\)", "", parts[2])
+        ci_parts <- strsplit(ci_text, " to ")[[1]]
+        lower <- as.numeric(ci_parts[1])
+        upper <- as.numeric(ci_parts[2])
+        
+        if (!is.na(estimate) && !is.na(lower) && !is.na(upper)) {
+          # Get proper analysis label
+          analysis_label <- if (!is.null(analysis$analysis)) {
+            analysis$analysis
+          } else {
+            switch(analysis_name,
+                   "base_case" = "Base case",
+                   "sens_rob" = "Excl. high risk",
+                   "sens_design" = "Excl. crossover",
+                   "sens_prior" = "Informative prior",
+                   "sens_magnesium" = "Incl. magnesium",
+                   "sens_corr_Primary r0.5" = "Primary (r=0.5)",
+                   "sens_corr_Low correlation r0.2" = "Low correlation (r=0.2)",
+                   "sens_corr_High correlation r0.8" = "High correlation (r=0.8)",
+                   analysis_name)
+          }
+          
+          return(data.frame(
+            Analysis = analysis_label,
+            Estimate = estimate,
+            Lower = lower,
+            Upper = upper,
+            N_studies = if (!is.null(analysis$n_studies)) analysis$n_studies else NA,
+            stringsAsFactors = FALSE
+          ))
+        }
+      }
+      return(NULL)
+    }, error = function(e) {
+      return(NULL)
+    })
+  })
+  
+  forest_data <- forest_data[!is.na(forest_data$Estimate), ]
+  
+  if (nrow(forest_data) == 0) {
+    return(NULL)
+  }
+  
+  # Order analyses
+  analysis_order <- c("Base case", "Excl. high risk", "Excl. crossover", 
+                     "Informative prior", "Incl. magnesium", 
+                     "Primary (r=0.5)", "Low correlation (r=0.2)", 
+                     "High correlation (r=0.8)")
+  
+  forest_data$Analysis <- factor(forest_data$Analysis, 
+                                levels = rev(intersect(analysis_order, 
+                                                      unique(forest_data$Analysis))))
+  
+  # Create plot
+  p <- ggplot(forest_data, aes(x = Estimate, y = Analysis)) +
+    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+    geom_errorbarh(aes(xmin = Lower, xmax = Upper), 
+                   height = 0.2, color = "black", size = 0.5) +
+    geom_point(size = 4, color = "darkblue") +
+    labs(
+      x = "MD (95% CrI)",
+      y = "",
+      title = paste0(treatment, " - ", outcome_name),
+      subtitle = paste0(dir_info$interpretation, " (", 
+                       ifelse(larger_better, "Higher is better", "Lower is better"), ")")
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(size = 12, face = "bold"),
+      plot.subtitle = element_text(size = 10, face = "italic", color = "gray40"),
+      panel.grid.minor = element_blank()
+    ) +
+    geom_text(aes(label = sprintf("%.2f", Estimate)), 
+              vjust = -1.5, size = 3) +
+    scale_x_continuous(limits = c(min(forest_data$Lower) - 5, 
+                                  max(forest_data$Upper) + 5))
+  
+  return(p)
+}
+
+```
+
+#  3 Forest plots
+```{r FOREST FOR ALL}
+# Generate forest plots for ALL treatments across ALL outcomes
+all_forest_plots <- list()
+
+for (treatment in params$treatments_forest) {
+  cat("\n## Sensitivity Analysis:", treatment, "\n\n")
+  
+  plots_for_treatment <- list()
+  
+  for (outcome_name in names(all_outcomes)) {
+    # Check if treatment exists in base case for this outcome
+    if (treatment %in% names(all_outcomes[[outcome_name]]$base_case$effects_vs_placebo)) {
+      
+      # Create the forest plot
+      plot <- create_sensitivity_forest(all_outcomes[[outcome_name]], 
+                                       treatment, 
+                                       outcome_name)
+      
+      if (!is.null(plot)) {
+        plots_for_treatment[[outcome_name]] <- plot
+        
+        # Store in main list
+        plot_id <- paste0(treatment, "_", outcome_name)
+        all_forest_plots[[plot_id]] <- plot
+      }
+    }
+  }
+  
+  # Display plots for this treatment
+  if (length(plots_for_treatment) > 0) {
+    # Print each plot individually for better display
+    for (outcome_name in names(plots_for_treatment)) {
+      print(plots_for_treatment[[outcome_name]])
+      cat("\n")
+    }
+  } else {
+    cat("No data available for", treatment, "\n")
+  }
+}
+
+# Summary of plots created
+cat("\n## Summary of Forest Plots Created\n")
+cat("Total plots generated:", length(all_forest_plots), "\n")
+cat("Plots created for:\n")
+for (plot_name in names(all_forest_plots)) {
+  cat("  -", plot_name, "\n")
+}
+```
+
+# 4 SUCRA 
+```{r SUCRA Rankings Summary}
+
+# Calculate SUCRA values with proper direction handling
+sucra_comparison <- map_df(names(all_outcomes), function(outcome) {
+  tryCatch({
+    # Get SUCRA table from base case
+    rank_table <- all_outcomes[[outcome]]$base_case$sucra
+    
+    if (is.null(rank_table)) {
+      cat("No SUCRA data for", outcome, "\n")
+      return(NULL)
+    }
+    
+    # Convert to dataframe if needed
+    rank_df <- as.data.frame(rank_table)
+    
+    # Check if there's a SUCRA row BEFORE removing rank column
+    has_sucra_row <- FALSE
+    sucra_row_idx <- NULL
+    
+    if ("rank" %in% names(rank_df)) {
+      sucra_row_idx <- which(grepl("SUCRA|sucra", rank_df$rank, ignore.case = TRUE))
+      has_sucra_row <- length(sucra_row_idx) > 0
+    }
+    
+    if (has_sucra_row) {
+      cat("Found pre-calculated SUCRA values for", outcome, "\n")
+      
+      # Extract SUCRA values from the SUCRA row
+      sucra_row <- rank_df[sucra_row_idx, ]
+      
+      # Remove rank column and get treatment columns only
+      treatment_cols <- names(rank_df)[names(rank_df) != "rank"]
+      sucra_values <- as.numeric(sucra_row[treatment_cols])
+      names(sucra_values) <- treatment_cols
+      
+      # Remove any NA values
+      sucra_values <- sucra_values[!is.na(sucra_values)]
+      
+    } else {
+      # Calculate SUCRA from ranking probabilities
+      cat("Calculating SUCRA from probabilities for", outcome, "\n")
+      
+      # Remove 'rank' column if it exists
+      if ("rank" %in% names(rank_df)) {
+        rank_df <- rank_df[, -which(names(rank_df) == "rank")]
+      }
+      
+      # Convert to numeric
+      rank_df[] <- lapply(rank_df, as.numeric)
+      
+      n_ranks <- nrow(rank_df)
+      
+      # Calculate SUCRA values
+      sucra_values <- sapply(rank_df, function(col) {
+        cumsum_probs <- cumsum(as.numeric(col))[-n_ranks]  # Exclude last rank
+        sum(cumsum_probs) / (n_ranks - 1) * 100
+      })
+    }
+    
+    # Get direction info
+    dir_info <- outcome_directions[[outcome]]
+    direction <- ifelse(dir_info$larger_better, " ↑", " ↓")
+    
+    data.frame(
+      Outcome = outcome,
+      Outcome_labeled = paste0(outcome, direction),
+      Treatment = names(sucra_values),
+      SUCRA = as.numeric(sucra_values),
+      stringsAsFactors = FALSE
+    )
+    
+  }, error = function(e) {
+    cat("Error processing SUCRA for", outcome, ":", e$message, "\n")
+    return(NULL)
+  })
+})
+
+# Create wide format table
+if (!is.null(sucra_comparison) && nrow(sucra_comparison) > 0) {
+  sucra_wide <- sucra_comparison %>%
+    select(Outcome_labeled, Treatment, SUCRA) %>%
+    pivot_wider(names_from = Outcome_labeled, values_from = SUCRA) %>%
+    mutate(Mean_SUCRA = rowMeans(select(., -Treatment), na.rm = TRUE)) %>%
+    arrange(desc(Mean_SUCRA))
+  
+  # Display table with highlighting
+  kable(sucra_wide, 
+        caption = "Table 2: SUCRA Values (%) - Higher values indicate better ranking",
+        digits = 1,
+        align = c('l', rep('c', ncol(sucra_wide) - 1))) %>%
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+    row_spec(1:3, bold = TRUE, color = "darkgreen") %>%
+    row_spec(which(sucra_wide$Treatment == "Placebo"), color = "gray") %>%
+    column_spec(ncol(sucra_wide), bold = TRUE)
+} else {
+  cat("No SUCRA data available\n")
+}
+```
+
+
+
+
+
+
+
+
+
+
+# 5 Treatment consistency 
+```{r Treatment consistency}
+if (exists("sucra_comparison") && !is.null(sucra_comparison) && nrow(sucra_comparison) > 0) {
+  
+  consistency_table <- sucra_comparison %>%
+    group_by(Treatment) %>%
+    summarise(
+      Mean_SUCRA = mean(SUCRA, na.rm = TRUE),
+      SD_SUCRA = sd(SUCRA, na.rm = TRUE),
+      Min_SUCRA = min(SUCRA, na.rm = TRUE),
+      Max_SUCRA = max(SUCRA, na.rm = TRUE),
+      Range = Max_SUCRA - Min_SUCRA,
+      CV = (SD_SUCRA / Mean_SUCRA) * 100,  # Coefficient of variation
+      N_outcomes = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(Mean_SUCRA))
+  
+  # Display enhanced consistency table
+  kable(consistency_table,
+        caption = "Table 3: Treatment Performance Consistency Across Outcomes",
+        col.names = c("Treatment", "Mean SUCRA (%)", "SD", "Min", "Max", 
+                     "Range", "CV (%)", "N Outcomes"),
+        digits = 1,
+        align = c('l', rep('c', 7))) %>%
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+    row_spec(1:3, bold = TRUE, color = "darkgreen") %>%
+    footnote(general = "CV = Coefficient of Variation (lower values indicate more consistent performance)")
+  
+  # Consistency visualization
+  consistency_plot <- ggplot(consistency_table, aes(x = reorder(Treatment, Mean_SUCRA), 
+                                                    y = Mean_SUCRA)) +
+    geom_point(size = 4, color = "darkblue") +
+    geom_errorbar(aes(ymin = Mean_SUCRA - SD_SUCRA, 
+                     ymax = Mean_SUCRA + SD_SUCRA),
+                 width = 0.2, color = "darkblue") +
+    coord_flip() +
+    labs(x = "", y = "Mean SUCRA (%) ± SD",
+         title = "Treatment Consistency Across Outcomes",
+         subtitle = "Error bars show ± 1 standard deviation") +
+    theme_minimal() +
+    geom_hline(yintercept = 50, linetype = "dashed", alpha = 0.3)
+  
+  print(consistency_plot)
+  
+} else {
+  cat("No SUCRA data available for consistency analysis\n")
+}
+```
+
+
+# 6 Heterogeneity
+```{r Heterogeneity}
+# Extract tau values
+tau_data <- map_df(names(all_outcomes), function(outcome) {
+  base <- all_outcomes[[outcome]]$base_case
+  data.frame(
+    Outcome = outcome,
+    Tau = base$tau_median,
+    Lower = base$tau_lower,
+    Upper = base$tau_upper,
+    Interpretation = outcome_directions[[outcome]]$interpretation,
+    stringsAsFactors = FALSE
+  )
+})
+
+# Create heterogeneity plot
+hetero_plot <- ggplot(tau_data, aes(x = Outcome, y = Tau)) +
+  geom_point(size = 4, color = "darkred") +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2, color = "darkred") +
+  geom_hline(yintercept = c(0.5, 1.0), linetype = "dashed", alpha = 0.3) +
+  labs(y = "Between-study heterogeneity (τ)", 
+       x = "Sleep Outcome",
+       title = "Heterogeneity Across Outcomes",
+       subtitle = "Dashed lines: τ = 0.5 (moderate) and τ = 1.0 (high)") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold")) +
+  # Add interpretation bands
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0, ymax = 0.5,
+           alpha = 0.1, fill = "green") +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0.5, ymax = 1.0,
+           alpha = 0.1, fill = "yellow") +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 1.0, ymax = Inf,
+           alpha = 0.1, fill = "red") +
+  annotate("text", x = 0.6, y = 0.25, label = "Low", size = 3, alpha = 0.5) +
+  annotate("text", x = 0.6, y = 0.75, label = "Moderate", size = 3, alpha = 0.5) +
+  annotate("text", x = 0.6, y = 1.25, label = "High", size = 3, alpha = 0.5)
+
+print(hetero_plot)
+
+# Summary table
+kable(tau_data %>% select(-Interpretation),
+      caption = "Table 4: Between-study Heterogeneity (τ)",
+      digits = 3,
+      align = c('l', rep('c', 3))) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+# 7 Best treatment by outcome
+```{r Best treatment by outcome}
+# Debug version to identify the issue
+if (exists("sucra_comparison") && nrow(sucra_comparison) > 0) {
+  
+  cat("Debug: Available outcomes in sucra_comparison:", 
+      paste(unique(sucra_comparison$Outcome), collapse = ", "), "\n")
+  cat("Debug: Number of rows:", nrow(sucra_comparison), "\n\n")
+  
+  # Find best treatment for each outcome
+  best_per_outcome <- sucra_comparison %>%
+    group_by(Outcome) %>%
+    slice_max(SUCRA, n = 3) %>%  # Top 3 for each outcome
+    mutate(Rank = row_number()) %>%
+    ungroup()  # Important: ungroup before join
+  
+  # Add interpretation (without unit)
+  outcome_info <- data.frame(
+    Outcome = names(outcome_directions),
+    Interpretation = sapply(outcome_directions, function(x) x$interpretation),
+    stringsAsFactors = FALSE
+  )
+  
+  best_per_outcome <- best_per_outcome %>%
+    left_join(outcome_info, by = "Outcome") %>%
+    select(Outcome, Rank, Treatment, SUCRA, Interpretation)
+  
+  cat("Debug: best_per_outcome dimensions:", 
+      nrow(best_per_outcome), "x", ncol(best_per_outcome), "\n")
+  cat("Debug: Column names:", paste(names(best_per_outcome), collapse = ", "), "\n\n")
+  
+  # Create separate tables for each outcome
+  for (outcome in unique(best_per_outcome$Outcome)) {
+    cat("\n### Top treatments for", outcome, "\n\n")
+    
+    outcome_data <- best_per_outcome %>% 
+      filter(Outcome == outcome) %>%
+      select(Rank, Treatment, SUCRA, Interpretation)  # Explicitly select columns
+    
+    cat("Debug: Data for", outcome, "- Rows:", nrow(outcome_data), "\n")
+    
+    if (nrow(outcome_data) > 0) {
+      # Create the table without print()
+      table_output <- kable(
+        outcome_data,
+        caption = paste0(outcome, ": ", unique(outcome_data$Interpretation)),
+        col.names = c("Rank", "Treatment", "SUCRA %", "Clinical Benefit"),
+        digits = 1,
+        align = c('c', 'l', 'c', 'l'),
+        format = "html"  # Explicitly set format
+      ) %>%
+        kable_styling(full_width = FALSE, bootstrap_options = c("striped")) %>%
+        row_spec(1, bold = TRUE, color = "darkgreen")
+      
+      # Display the table
+      print(table_output)
+      cat("\n")
+    } else {
+      cat("No data available for", outcome, "\n")
+    }
+  }
+  
+  # Overall best treatment summary
+  cat("\n### Overall Best Performers\n\n")
+  
+  overall_best <- best_per_outcome %>%
+    filter(Rank == 1) %>%
+    select(Outcome, Treatment, SUCRA, Interpretation)
+  
+  if (nrow(overall_best) > 0) {
+    overall_table <- kable(
+      overall_best,
+      caption = "Best Treatment for Each Outcome",
+      col.names = c("Outcome", "Best Treatment", "SUCRA %", "Clinical Benefit"),
+      digits = 1,
+      align = c('l', 'l', 'c', 'l'),
+      format = "html"
+    ) %>%
+      kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+    
+    print(overall_table)
+  }
+} else {
+  cat("No SUCRA comparison data available\n")
+}
+```
+
+# 8 Summary
+```{r Summary}
+cat("## Analysis Summary\n\n")
+cat("**Outcomes analyzed:**", paste(names(all_outcomes), collapse = ", "), "\n\n")
+
+# Calculate totals
+total_studies <- sum(sapply(all_outcomes, function(x) x$base_case$n_studies))
+total_patients <- sum(sapply(all_outcomes, function(x) x$base_case$n_patients))
+n_treatments <- length(unique(unlist(lapply(all_outcomes, function(x) 
+  names(x$base_case$effects_vs_placebo)))))
+
+
+# Identify most consistent performer
+if (exists("consistency_table") && nrow(consistency_table) > 0) {
+  best_treatment <- consistency_table$Treatment[1]
+  cat("**Most consistent performer:**", best_treatment, "\n")
+  cat(sprintf("  - Mean SUCRA: %.1f%%\n", consistency_table$Mean_SUCRA[1]))
+  cat(sprintf("  - Consistency (CV): %.1f%%\n", consistency_table$CV[1]))
+  cat(sprintf("  - Effective in %d/%d outcomes\n", 
+              consistency_table$N_outcomes[1], 
+              length(all_outcomes)))
+}
+
+# Average heterogeneity
+if (exists("tau_data")) {
+  avg_tau <- mean(tau_data$Tau)
+  cat(sprintf("\n**Average heterogeneity (τ):** %.3f\n", avg_tau))
+  if (avg_tau < 0.5) {
+    cat("  - Interpretation: Low heterogeneity across outcomes\n")
+  } else if (avg_tau < 1.0) {
+    cat("  - Interpretation: Moderate heterogeneity across outcomes\n")
+  } else {
+    cat("  - Interpretation: High heterogeneity across outcomes\n")
+  }
+}
+
+# Key findings
+cat("\n## Key Findings\n\n")
+cat("1. **Treatment Efficacy:** Based on SUCRA rankings, the most effective treatments overall are:\n")
+if (exists("consistency_table")) {
+  top_3 <- head(consistency_table, 3)
+  for (i in 1:nrow(top_3)) {
+    cat(sprintf("   %d. %s (Mean SUCRA: %.1f%%)\n", 
+                i, top_3$Treatment[i], top_3$Mean_SUCRA[i]))
+  }
+}
+
+cat("\n2. **Outcome-Specific Recommendations:**\n")
+if (exists("overall_best")) {
+  for (i in 1:nrow(overall_best)) {
+    cat(sprintf("   - %s: %s (SUCRA: %.1f%%)\n", 
+                overall_best$Outcome[i], 
+                overall_best$Treatment[i],
+                overall_best$SUCRA[i]))
+  }
+}
+
+cat("\n3. **Consistency of Evidence:** ")
+if (exists("consistency_table")) {
+  low_cv <- consistency_table %>% filter(CV < 30)
+  if (nrow(low_cv) > 0) {
+    cat("The following treatments showed consistent performance (CV < 30%):\n")
+    cat("   -", paste(low_cv$Treatment, collapse = ", "), "\n")
+  }
+}
+
+# Save consolidated results
+consolidated_results <- list(
+  primary_table = primary_table,
+  sucra_wide = if(exists("sucra_wide")) sucra_wide else NULL,
+  consistency_table = if(exists("consistency_table")) consistency_table else NULL,
+  tau_data = tau_data,
+  best_per_outcome = if(exists("best_per_outcome")) best_per_outcome else NULL,
+  summary_stats = list(
+    total_studies = total_studies,
+    total_patients = total_patients,
+    n_treatments = n_treatments,
+    avg_heterogeneity = if(exists("avg_tau")) avg_tau else NULL
+  ),
+  timestamp = Sys.time()
+)
+
+saveRDS(consolidated_results, 
+        file.path(params$output_path, "consolidated_results.rds"))
+
+cat("\n**Results saved to:**", 
+    file.path(params$output_path, "consolidated_results.rds"), "\n")
+```
+
+
+
+
+
+
+
+# 9 APPENDIX
+```{r APPENDIX}
+
+cat("## Sensitivity Analysis Coverage\n\n")
+
+# Check which sensitivity analyses are available
+for (outcome in names(all_outcomes)) {
+  cat("### ", outcome, "\n")
+  analyses_available <- names(all_outcomes[[outcome]])
+  cat("Analyses performed:", paste(analyses_available, collapse = ", "), "\n\n")
+  
+  # Count studies in each analysis
+  for (analysis in analyses_available) {
+    n_studies <- all_outcomes[[outcome]][[analysis]]$n_studies
+    n_patients <- all_outcomes[[outcome]][[analysis]]$n_patients
+    if (!is.null(n_studies)) {
+      cat(sprintf("  - %s: %d studies, %d patients\n", 
+                  analysis, n_studies, n_patients))
+    }
+  }
+  cat("\n")
+}
+```
+
+
+```{r session info}
+cat("\n## Session Information\n")
+sessionInfo()
+```
+

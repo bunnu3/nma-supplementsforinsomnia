@@ -1,0 +1,725 @@
+
+---
+title: "exploring heterogeneity and other analyses - `r params$outcomes`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+params:
+  outcomes:  ["SOL", "PSQI", "WASO", "TST", "SE"]                      #NOA and ISI can be added in the future
+  file_path: "C:/Users/risha/OneDrive/Desktop/Insomnia_consol_NMA.xlsx"
+  reference: Placebo
+  mcmc_long: FALSE
+  output_path: "C:/Users/risha/OneDrive/Desktop/NMA"
+  prospero_id: CRD420251088062
+  treatment_column: "treatment_class"                       # Options: "treatment_class", "treatment_formulation", "treatment"
+  continuous_covariates: ["age", "female_percent", "duration", "year"]
+  categorical_covariates: ["design", "rob", "dose_category", age_category]
+---
+
+```{r setup, include = FALSE}
+# ---- global knitr options ----
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 7
+)
+
+# ---- reproducibility ----
+set.seed(123)
+```
+
+```{r libraries}
+
+# Load all libraries once
+library(BUGSnet)
+library(coda)
+library(dplyr)
+library(readxl)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+
+```
+
+# settings
+```{r settings}
+# GET USER CONFIGURATION FROM PARAMS
+OUTCOMES_TO_ANALYZE <- params$outcomes
+FILE_PATH <- params$file_path
+REFERENCE_TRT <- params$reference
+OUTPUT_PATH <- params$output_path
+LONG <- isTRUE(params$mcmc_long)
+PROSPERO_ID <- params$prospero_id
+TREATMENT_COLUMN <- params$treatment_column
+CONTINUOUS_COVARIATES <- params$continuous_covariates
+CATEGORICAL_COVARIATES <- params$categorical_covariates
+NODE_SPLIT_TREATMENT_COLUMN <- "treatment_class"
+
+
+# MCMC settings
+ITER  <- if (LONG) 300000 else 100000
+BURN  <- if (LONG) 100000 else 50000
+ADAPT <- if (LONG) 10000 else 5000
+THIN <- if (LONG) 5 else 10
+CHAINS <- if (LONG) 6 else 3
+
+# Define outcome directions
+outcome_directions <- list(
+  SOL = list(larger_better = FALSE, interpretation = "Reduced sleep onset latency"),
+  PSQI = list(larger_better = FALSE, interpretation = "Reduced sleep disturbance"),
+  WASO = list(larger_better = FALSE, interpretation = "Reduced wake after sleep onset"),
+  NOA = list(larger_better = FALSE, interpretation = "Reduced number of awakenings"),
+  ISI = list(larger_better = FALSE, interpretation = "Reduced insomnia severity"),
+  TST = list(larger_better = TRUE, interpretation = "Increased total sleep time"),
+  SE = list(larger_better = TRUE, interpretation = "Increased sleep efficiency")
+)
+
+# --- Outcome directions (global lookup, define ONCE) ---
+outcome_directions <- list(
+  SOL  = list(larger_better = FALSE, direction = "lower",
+              interpretation = "Reduced sleep onset latency"),
+  PSQI = list(larger_better = FALSE, direction = "lower",
+              interpretation = "Reduced sleep disturbance"),
+  WASO = list(larger_better = FALSE, direction = "lower",
+              interpretation = "Reduced wake after sleep onset"),
+  NOA  = list(larger_better = FALSE, direction = "lower",
+              interpretation = "Reduced number of awakenings"),
+  ISI  = list(larger_better = FALSE, direction = "lower",
+              interpretation = "Reduced insomnia severity"),
+  TST  = list(larger_better = TRUE,  direction = "higher",
+              interpretation = "Increased total sleep time"),
+  SE   = list(larger_better = TRUE,  direction = "higher",
+              interpretation = "Increased sleep efficiency")
+)
+
+get_outcome_settings <- function(name) {
+  os <- outcome_directions[[name]]
+  if (is.null(os)) os <- list(larger_better = TRUE,
+                              direction = "higher",
+                              interpretation = "Larger is better")
+  os
+}
+
+
+# Master output directory
+MASTER_DIAG_DIR <- file.path(OUTPUT_PATH, "advanced_diagnostics_all")
+dir.create(MASTER_DIAG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+cat("========== ADVANCED DIAGNOSTICS FOR MULTIPLE OUTCOMES ==========\n")
+cat("PROSPERO Registration:", PROSPERO_ID, "\n")
+cat("Outcomes to analyze:", paste(OUTCOMES_TO_ANALYZE, collapse = ", "), "\n")
+cat("Treatment column:", TREATMENT_COLUMN, "\n")
+cat("Continuous covariates:", paste(CONTINUOUS_COVARIATES, collapse = ", "), "\n")
+cat("Categorical covariates:", paste(CATEGORICAL_COVARIATES, collapse = ", "), "\n")
+cat("MCMC iterations:", ITER, "\n")
+cat("Output directory:", MASTER_DIAG_DIR, "\n\n")
+
+
+```
+
+
+# Storage
+```{r storage}
+# master storage for all outcomes
+master_convergence <- list()
+master_metaregression <- list()
+master_baseline <- list()
+master_errors <- list()
+```
+
+
+```{r Beta}
+get_beta_draws <- function(fit) {
+  sl <- fit$samples$BUGSoutput$sims.list
+  # Equal prior -> single coefficient `B`
+  if (!is.null(sl$B)) return(as.numeric(sl$B))
+  # Otherwise BUGSnet uses `beta` (vector across treatments)
+  if (!is.null(sl$beta)) {
+    b <- sl$beta
+    if (is.null(dim(b))) return(as.numeric(b))        # just a vector
+    if (length(dim(b)) == 2) return(rowMeans(b))      # draws x K -> average across K
+    return(as.numeric(apply(b, 1, mean)))             # fallback for unusual shapes
+  }
+  # Last resort: pull any beta[...] columns from coda varnames
+  vn <- coda::varnames(fit$samples)
+  bnames <- grep("^beta(\\[|$)", vn, value = TRUE)
+  if (length(bnames)) {
+    mats <- lapply(fit$samples, function(ch) as.matrix(ch[, bnames, drop = FALSE]))
+    m <- do.call(rbind, mats)
+    return(rowMeans(m))
+  }
+  return(NULL)
+}
+
+```
+
+
+
+# 1. analysis loop# 
+```{r analysis}
+# 1. analysis loop
+cat("========== STARTING ANALYSIS LOOP ==========\n\n")
+
+for (OUTCOME_NAME in OUTCOMES_TO_ANALYZE) {
+  
+  os <- get_outcome_settings(OUTCOME_NAME)
+  LARGER_BETTER  <- os$larger_better
+  DIRECTION      <- os$direction
+  INTERPRETATION <- os$interpretation
+
+  cat("=====================================\n")
+  cat("ANALYZING OUTCOME:", OUTCOME_NAME, "\n")
+  cat("=====================================\n\n")
+
+  # -- Load data once
+  cat("Loading data for", OUTCOME_NAME, "...\n")
+  data_raw <- readxl::read_excel(FILE_PATH, sheet = OUTCOME_NAME) %>%
+    dplyr::mutate(across(c(mean, sd, n), as.numeric)) %>%
+    dplyr::filter(!is.na(mean), !is.na(sd), !is.na(n))
+
+  # Cast present categorical covariates to factors
+  cats_present <- intersect(CATEGORICAL_COVARIATES, names(data_raw))
+  if (length(cats_present) > 0) {
+    data_raw <- data_raw %>% dplyr::mutate(across(all_of(cats_present), ~factor(.)))
+  }
+
+  # Must have treatment & study
+  if (!TREATMENT_COLUMN %in% names(data_raw)) {
+    cat("Treatment column", TREATMENT_COLUMN, "not found. Skipping", OUTCOME_NAME, "\n\n")
+    next
+  }
+  data_raw <- data_raw %>% dplyr::filter(!is.na(.data[[TREATMENT_COLUMN]]), !is.na(study))
+
+  cat("  Studies:", dplyr::n_distinct(data_raw$study), "\n")
+  cat("  Total patients:", sum(data_raw$n), "\n")
+
+  # Available covariates (present in sheet)
+  available_continuous  <- intersect(CONTINUOUS_COVARIATES, names(data_raw))
+  available_categorical <- intersect(CATEGORICAL_COVARIATES,  names(data_raw))
+  cat("  Available continuous covariates:", paste(available_continuous, collapse = ", "), "\n")
+  cat("  Available categorical covariates:", paste(available_categorical, collapse = ", "), "\n")
+
+  # Prepare network
+  data_prep <- BUGSnet::data.prep(
+    arm.data = data_raw,
+    varname.t = TREATMENT_COLUMN,
+    varname.s = "study"
+  )
+
+  # ---- 1) Baseline random-effects model
+  cat("\n1. Running baseline model...\n")
+  model_base <- BUGSnet::nma.model(
+    data = data_prep,
+    outcome = "mean", N = "n", sd = "sd",
+    reference = REFERENCE_TRT,
+    family = "normal", link = "identity",
+    effects = "random"
+  )
+
+  results_base <- BUGSnet::nma.run(
+    model_base,
+    n.iter = ITER, n.burnin = BURN, n.adapt = ADAPT, n.chains = CHAINS,
+    monitor = c("d", "sigma", "dic", "beta", "B", "pD")
+  )
+  fit_base <- BUGSnet::nma.fit(results_base)
+
+  summ_base  <- summary(results_base$samples)
+  dic_base   <- as.numeric(fit_base$DIC)
+  pD_base    <- fit_base$pD
+  tau_base   <- as.numeric(summ_base$quantiles["sigma", "50%"])
+  tau_base_ci<- as.numeric(summ_base$quantiles["sigma", c("2.5%", "97.5%")])
+  
+cat("  pD:", round(pD_base, 1), "\n") 
+  cat("  DIC:", round(dic_base, 1), "\n")
+  cat("  \u03C4:", round(tau_base, 3), "[", round(tau_base_ci[1], 3), ",", round(tau_base_ci[2], 3), "]\n")
+
+  master_baseline[[OUTCOME_NAME]] <- list(
+    outcome    = OUTCOME_NAME,
+    dic        = dic_base,
+    tau        = tau_base,
+    pD         = pD_base,
+    tau_lower  = tau_base_ci[1],
+    tau_upper  = tau_base_ci[2],
+    n_studies  = dplyr::n_distinct(data_raw$study),
+    n_patients = sum(data_raw$n)
+  )
+
+  # ---- 2) Convergence diagnostics
+  cat("\n2. Checking convergence...\n")
+  max_rhat <- NA_real_; min_eff <- NA_real_; conv_method <- "standard"
+  tryCatch({
+    g <- coda::gelman.diag(results_base$samples, multivariate = FALSE)
+    rhat_values <- g$psrf[, "Point est."]
+    max_rhat <- max(rhat_values, na.rm = TRUE)
+    eff_size <- coda::effectiveSize(results_base$samples)
+    min_eff  <- min(eff_size, na.rm = TRUE)
+  }, error = function(e) {
+    conv_method <<- "individual_fallback"
+    vnames <- coda::varnames(results_base$samples)
+    rhat_vec <- rep(NA_real_, length(vnames))
+    for (i in seq_along(vnames)) {
+      tmp <- try(coda::gelman.diag(results_base$samples[, vnames[i]]), silent = TRUE)
+      if (!inherits(tmp, "try-error")) rhat_vec[i] <- tmp$psrf[, "Point est."]
+    }
+    max_rhat <<- suppressWarnings(max(rhat_vec, na.rm = TRUE))
+    eff_size  <- coda::effectiveSize(results_base$samples)
+    min_eff   <<- suppressWarnings(min(eff_size, na.rm = TRUE))
+  })
+  master_convergence[[OUTCOME_NAME]] <- list(
+    outcome = OUTCOME_NAME,
+    max_rhat = max_rhat,
+    converged = is.finite(max_rhat) && max_rhat < 1.05,
+    min_eff_size = min_eff,
+    diagnostic_method = conv_method
+  )
+  cat("  Max R-hat:", round(max_rhat, 3), "\n")
+  cat("  Min effective size:", round(min_eff, 0), "\n")
+  if (conv_method != "standard") cat("  (Used individual parameter diagnostics)\n")
+
+  # ---- Helper: pull a non-degenerate beta series from mcmc.list
+  get_beta_draws <- function(mcmc_list) {
+    M <- do.call(rbind, lapply(mcmc_list, function(x) base::as.matrix(x)))
+    cn <- colnames(M)
+    # Candidate names: "beta", "beta[...]", occasionally "B[...]" if coded differently
+    idx <- grep("(^|\\.)beta(\\[|$)|(^|\\.)B(\\[|$)", cn, perl = TRUE, ignore.case = FALSE)
+    if (length(idx) == 0) return(NULL)
+    # Prefer columns with *non-zero variance*
+    sds <- apply(M[, idx, drop = FALSE], 2, stats::sd, na.rm = TRUE)
+    idx <- idx[order(-sds)]
+    # Pick the first with positive variance
+    for (j in idx) {
+      v <- M[, j]
+      if (is.finite(stats::sd(v, na.rm = TRUE)) && stats::sd(v, na.rm = TRUE) > 0) return(v)
+    }
+    # If all are degenerate, return the first (caller will treat as NA)
+    M[, idx[1]]
+  }
+
+  # ---- 3) Meta-regression
+  cat("\n3. Running meta-regression...\n")
+  outcome_metareg_results <- list()
+
+  # 3A) Continuous moderators
+  if (length(available_continuous) > 0) {
+    cat("  Testing continuous covariates:\n")
+    for (covariate in available_continuous) {
+      covar_data <- data_raw %>% dplyr::filter(!is.na(.data[[covariate]]))
+      vals <- covar_data[[covariate]]
+      if (nrow(covar_data) >= 10 && length(unique(vals)) >= 3 && stats::sd(vals, na.rm = TRUE) > 0) {
+        covar_data <- covar_data %>%
+          dplyr::mutate(covar_centered = as.numeric(scale(.data[[covariate]], center = TRUE, scale = FALSE)))
+        if (isTRUE(all(is.na(covar_data$covar_centered))) ||
+            stats::sd(covar_data$covar_centered, na.rm = TRUE) == 0) {
+          cat("    ", covariate, ": No variation after centering\n", sep = "")
+          next
+        }
+
+        data_metareg <- BUGSnet::data.prep(
+          arm.data = covar_data,
+          varname.t = TREATMENT_COLUMN,
+          varname.s = "study"
+        )
+
+        model_metareg <- BUGSnet::nma.model(
+          data = data_metareg,
+          outcome = "mean", N = "n", sd = "sd",
+          reference = REFERENCE_TRT,
+          family = "normal", link = "identity",
+          effects = "random",
+          covariate = "covar_centered",
+          prior.beta = "EQUAL"  # required when a covariate is specified
+        )
+
+        results_metareg <- BUGSnet::nma.run(
+          model_metareg,
+          n.iter = ITER, n.burnin = BURN, n.adapt = ADAPT, n.chains = CHAINS,
+          monitor = c("beta", "B", "sigma", "dic", "pD")
+        )
+        fit_metareg <- BUGSnet::nma.fit(results_metareg)
+
+        beta_draws <- get_beta_draws(results_metareg$samples)
+        if (is.null(beta_draws) || !is.numeric(beta_draws) ||
+            stats::sd(beta_draws, na.rm = TRUE) == 0) {
+          beta_med <- beta_lcl <- beta_ucl <- p_value <- NA_real_
+        } else {
+          q <- stats::quantile(beta_draws, c(0.025, 0.5, 0.975), na.rm = TRUE)
+          beta_lcl <- as.numeric(q[1]); beta_med <- as.numeric(q[2]); beta_ucl <- as.numeric(q[3])
+          p_value  <- 2 * min(mean(beta_draws > 0, na.rm = TRUE),
+                              mean(beta_draws < 0, na.rm = TRUE))
+        }
+
+        summ_meta   <- summary(results_metareg$samples)
+        tau_metareg <- suppressWarnings(as.numeric(summ_meta$quantiles["sigma", "50%"]))
+        dic_change  <- as.numeric(fit_metareg$DIC) - dic_base
+        var_explained <- if (is.finite(tau_base) && is.finite(tau_metareg) && tau_base > 0) {
+          max(0, (tau_base^2 - tau_metareg^2) / tau_base^2 * 100)
+        } else NA_real_
+
+        outcome_metareg_results[[covariate]]$tau_post <- tau_metareg
+        
+        outcome_metareg_results[[covariate]] <- list(
+          outcome        = OUTCOME_NAME,
+          covariate      = covariate,
+          covariate_type = "continuous",
+          beta           = beta_med,
+          beta_lower     = beta_lcl,
+          beta_upper     = beta_ucl,
+          p_value        = p_value,
+          var_explained  = var_explained,
+          dic_change     = dic_change,
+          tau_post       = tau_metareg
+        )
+
+        cat("    ", covariate, ": ",
+            ifelse(is.na(beta_med), "β=NA, p=NA", paste0("\u03B2=", round(beta_med, 3), ", p=", round(p_value, 3))),
+            "\n", sep = "")
+      } else {
+        cat("    ", covariate, ": Insufficient data\n", sep = "")
+      }
+    }
+  }
+
+  # 3B) Categorical moderators
+  if (length(available_categorical) > 0) {
+    cat("  Testing categorical covariates:\n")
+    for (covariate in available_categorical) {
+      covar_data <- data_raw %>% dplyr::filter(!is.na(.data[[covariate]]))
+      levs <- levels(droplevels(covar_data[[covariate]]))
+      if (is.null(levs)) levs <- unique(covar_data[[covariate]])
+      n_levels <- length(levs)
+
+      if (n_levels >= 2 && n_levels <= 5 && nrow(covar_data) >= 15) {
+        ref_level <- sort(levs)[1]
+        cat("    ", covariate, " (ref=", ref_level, "):\n", sep = "")
+
+        for (lev in setdiff(levs, ref_level)) {
+          tmp <- covar_data %>% dplyr::mutate(dummy_cov = as.numeric(.data[[covariate]] == lev))
+
+          data_metareg <- BUGSnet::data.prep(
+            arm.data = tmp,
+            varname.t = TREATMENT_COLUMN,
+            varname.s = "study"
+          )
+
+          model_metareg <- BUGSnet::nma.model(
+            data = data_metareg,
+            outcome = "mean", N = "n", sd = "sd",
+            reference = REFERENCE_TRT,
+            family = "normal", link = "identity",
+            effects = "random",
+            covariate = "dummy_cov",
+            prior.beta = "EQUAL"
+          )
+
+          results_metareg <- BUGSnet::nma.run(
+            model_metareg,
+            n.iter = ITER, n.burnin = BURN, n.adapt = ADAPT, n.chains = CHAINS,
+            monitor = c("beta", "B", "sigma", "dic", "pD")
+          )
+          fit_metareg <- BUGSnet::nma.fit(results_metareg)
+
+          beta_draws <- get_beta_draws(results_metareg$samples)
+          if (is.null(beta_draws) || !is.numeric(beta_draws) ||
+              stats::sd(beta_draws, na.rm = TRUE) == 0) {
+            beta_med <- beta_lcl <- beta_ucl <- p_value <- NA_real_
+          } else {
+            q <- stats::quantile(beta_draws, c(0.025, 0.5, 0.975), na.rm = TRUE)
+            beta_lcl <- as.numeric(q[1]); beta_med <- as.numeric(q[2]); beta_ucl <- as.numeric(q[3])
+            p_value  <- 2 * min(mean(beta_draws > 0, na.rm = TRUE),
+                                mean(beta_draws < 0, na.rm = TRUE))
+          }
+
+          summ_meta   <- summary(results_metareg$samples)
+          tau_metareg <- suppressWarnings(as.numeric(summ_meta$quantiles["sigma", "50%"]))
+          dic_change  <- as.numeric(fit_metareg$DIC) - dic_base
+          var_explained <- if (is.finite(tau_base) && is.finite(tau_metareg) && tau_base > 0) {
+            max(0, (tau_base^2 - tau_metareg^2) / tau_base^2 * 100)
+          } else NA_real_
+          
+          outcome_metareg_results[[covariate]]$tau_post <- tau_metareg
+
+          outcome_metareg_results[[paste0(covariate, "_", lev)]] <- list(
+            outcome        = OUTCOME_NAME,
+            covariate      = paste0(covariate, ": ", lev, " vs ", ref_level),
+            covariate_type = "categorical",
+            beta           = beta_med,
+            beta_lower     = beta_lcl,
+            beta_upper     = beta_ucl,
+            p_value        = p_value,
+            var_explained  = var_explained,
+            dic_change     = dic_change,
+            tau_post       = tau_metareg
+          )
+
+          cat("      ", lev, " vs ", ref_level, ": ",
+              ifelse(is.na(beta_med), "β=NA, p=NA", paste0("\u03B2=", round(beta_med, 3), ", p=", round(p_value, 3))),
+              "\n", sep = "")
+        }
+      } else {
+        cat("    ", covariate, ": Skipped (", n_levels, " levels)\n", sep = "")
+      }
+    }
+  }
+
+  if (length(outcome_metareg_results) > 0) {
+    master_metaregression[[OUTCOME_NAME]] <- outcome_metareg_results
+  }
+
+  cat("\n\u2713 Completed analysis for", OUTCOME_NAME, "\n\n")
+}
+
+cat("\n========== ANALYSIS LOOP COMPLETE ==========\n\n")
+
+```
+
+
+#  2. Meta-regression summary
+```{r meta-reg sum}
+cat("\n========== META-REGRESSION SUMMARY ==========\n\n")
+
+if (length(master_metaregression) > 0) {
+  # Flatten all meta-regression results with error handling
+  metareg_list <- list()
+  
+  for (outcome in names(master_metaregression)) {
+    for (covar in names(master_metaregression[[outcome]])) {
+      result <- master_metaregression[[outcome]][[covar]]
+      
+      # Check if result has all required fields
+      required_fields <- c("outcome", "covariate", "covariate_type", "beta", 
+                          "beta_lower", "beta_upper", "p_value", "var_explained", "dic_change")
+      
+      if (all(required_fields %in% names(result))) {
+        metareg_list[[length(metareg_list) + 1]] <- result
+      } else {
+        cat("Warning: Skipping incomplete result for", outcome, "-", covar, "\n")
+      }
+    }
+  }
+  
+  if (length(metareg_list) > 0) {
+    # Create data frame with error handling for each result
+    metareg_df_list <- lapply(metareg_list, function(x) {
+      tryCatch({
+        data.frame(
+          Outcome = as.character(x$outcome %||% "Unknown"),
+          Covariate = as.character(x$covariate %||% "Unknown"),
+          Type = as.character(x$covariate_type %||% "Unknown"),
+          Beta = round(as.numeric(x$beta %||% NA), 3),
+          CI = paste0("[", round(as.numeric(x$beta_lower %||% NA), 3), ", ", 
+                     round(as.numeric(x$beta_upper %||% NA), 3), "]"),
+          P_value = round(as.numeric(x$p_value %||% NA), 3),
+          Var_Explained = ifelse(is.na(x$var_explained) || is.null(x$var_explained), 
+                               "-", round(as.numeric(x$var_explained), 1)),
+          Delta_DIC = round(as.numeric(x$dic_change %||% NA), 1),
+          stringsAsFactors = FALSE
+        )
+      }, error = function(e) {
+        cat("Warning: Error processing meta-regression result:", e$message, "\n")
+        return(NULL)
+      })
+    })
+    
+    # Remove NULL results and combine
+    metareg_df_list <- metareg_df_list[!sapply(metareg_df_list, is.null)]
+    
+    if (length(metareg_df_list) > 0) {
+      metareg_df <- do.call(rbind, metareg_df_list)
+      
+      # Rest of your code remains the same
+      metareg_df <- metareg_df %>%
+        arrange(P_value)
+      
+      # Display significant results first
+      significant_df <- metareg_df %>% filter(P_value < 0.05 & !is.na(P_value))
+      
+      if (nrow(significant_df) > 0) {
+        cat("SIGNIFICANT MODERATORS (p < 0.05):\n")
+        print(kable(significant_df,
+              caption = "Significant Meta-Regression Results",
+              col.names = c("Outcome", "Covariate", "Type", "β", "95% CrI", "P-value", "Var Exp (%)", "ΔDIC")) %>%
+          kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+          row_spec(1:nrow(significant_df), bold = TRUE, color = "blue"))
+      } else {
+        cat("No significant moderators found (p < 0.05)\n")
+      }
+      
+      cat("\nALL META-REGRESSION RESULTS:\n")
+      print(kable(metareg_df,
+            caption = "Complete Meta-Regression Results Across All Outcomes",
+            col.names = c("Outcome", "Covariate", "Type", "β", "95% CrI", "P-value", "Var Exp (%)", "ΔDIC")) %>%
+        kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+        row_spec(which(metareg_df$P_value < 0.05 & !is.na(metareg_df$P_value)), bold = TRUE, color = "blue"))
+      
+      # Save
+      write.csv(metareg_df,
+                file.path(MASTER_DIAG_DIR, "metaregression_all_outcomes.csv"),
+                row.names = FALSE)
+    } else {
+      cat("No valid meta-regression results to display\n")
+    }
+  } else {
+    cat("No meta-regression results found\n")
+  }
+} else {
+  cat("No meta-regression analyses were completed\n")
+}
+
+```
+
+```{r baseline-summary, results='asis', echo=FALSE}
+library(dplyr)
+library(knitr)
+
+# Convert master_baseline (a list of lists) into a data.frame
+baseline_df <- bind_rows(master_baseline) %>%
+  transmute(
+    Outcome       = outcome,
+    `N studies`   = n_studies,
+    `N patients`  = n_patients,
+    DIC           = round(dic, 1),
+    pD            = round(pD, 1),
+    Tau           = round(tau, 3),
+    `Tau 95% CI`  = sprintf("[%0.3f, %0.3f]", tau_lower, tau_upper)
+  )
+
+# Print as a nice table
+kable(baseline_df,
+      caption = "Baseline Random-Effects NMA Fit Statistics",
+      align   = "lrrrrrr") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+
+```{r meta_reg_all, results='asis', echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(purrr)
+library(kableExtra)
+
+# Flatten the nested list -> data frame
+all_results_df <- imap_dfr(master_metaregression, ~{
+  # .x = list of covariates for one outcome, .y = outcome name
+  bind_rows(lapply(.x, as.data.frame)) %>%
+    mutate(Outcome = .y)
+}) %>%
+  transmute(
+   Outcome,
+    Covariate      = covariate,
+    Type           = covariate_type,
+    Tau            = round(tau_post, 3),
+    `β`            = round(beta, 3),
+    `95% CrI`      = sprintf("[%0.3f, %0.3f]", beta_lower, beta_upper),
+    `P-value`      = round(p_value, 3),
+    `Var Exp (%)`  = round(var_explained, 1),
+    `ΔDIC`         = round(dic_change, 1)
+  ) %>%
+  mutate(
+    across(c(`β`, `P-value`, `Var Exp (%)`, `ΔDIC`), ~suppressWarnings(round(., 3)))
+  ) %>%
+  arrange(Outcome, Covariate)
+
+if (!nrow(all_results_df)) {
+  cat("No meta-regression models were run.")
+} else {
+  # Render a single table with all rows; significant rows are just highlighted
+  kbl <- all_results_df %>%
+    kable(format = "html",
+          caption = "Complete Meta-Regression Results Across All Outcomes",
+          escape = FALSE) %>%
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+    collapse_rows(columns = 1, latex_hline = "none")
+
+  sig_rows <- which(suppressWarnings(as.numeric(all_results_df[["P-value"]])) < 0.05)
+  if (length(sig_rows)) {
+    kbl <- kbl %>% row_spec(sig_rows, bold = TRUE, color = "blue")
+  }
+  kbl
+}
+```
+
+
+
+
+
+#### 3. testing alternative
+
+
+```{r gelman_rhat_summary, results='asis', message=FALSE, warning=FALSE}
+library(dplyr)
+library(readxl)
+library(BUGSnet)
+library(coda)
+library(knitr)
+library(kableExtra)
+
+rhat_rows <- list()
+
+for (OUTCOME_NAME in OUTCOMES_TO_ANALYZE) {
+  # 1. Load & prep data
+  dat <- read_excel(FILE_PATH, sheet = OUTCOME_NAME) %>%
+    mutate(across(c(mean, sd, n), as.numeric)) %>%
+    filter(!is.na(mean), !is.na(sd), !is.na(n),
+           !is.na(.data[[TREATMENT_COLUMN]]), !is.na(study))
+  if (!nrow(dat)) next
+
+  dp <- data.prep(arm.data = dat, varname.t = TREATMENT_COLUMN, varname.s = "study")
+
+  # 2. Run baseline model, sampling only d, sigma, beta
+  fit0 <- nma.run(
+    nma.model(dp,
+              outcome   = "mean",
+              N         = "n",
+              sd        = "sd",
+              reference = REFERENCE_TRT,
+              family    = "normal",
+              link      = "identity",
+              effects   = "random"),
+    n.iter   = ITER,
+    n.burnin = BURN,
+    n.adapt  = ADAPT,
+    n.chains = CHAINS,
+    monitor  = c("d", "sigma", "beta")   
+  )
+
+  # 3. Convergence (R-hat)
+  gd      <- gelman.diag(fit0$samples, multivariate = FALSE)
+  max_rh  <- max(gd$psrf[,"Point est."], na.rm = TRUE)
+
+  # 4. Effective Sample Size (ESS)
+  #    bind all chains into one matrix for only sampled columns
+  mat_all <- do.call(rbind, lapply(fit0$samples, as.matrix))
+  #    drop any columns you didn’t want, just keep the ones in monitor
+  sampled_params <- intersect(colnames(mat_all), c("d","sigma", grep("^beta", colnames(mat_all), value=TRUE)))
+  ess_vals       <- effectiveSize(mat_all[, sampled_params, drop=FALSE])
+  min_ess        <- min(ess_vals, na.rm = TRUE)
+
+  # 5. Record
+  rhat_rows[[OUTCOME_NAME]] <- tibble(
+    Outcome     = OUTCOME_NAME,
+    `Max R-hat` = round(max_rh, 3),
+    `Min ESS`   = round(min_ess, 0)
+  )
+}
+
+# 6. Print table
+tab <- bind_rows(rhat_rows)
+if (nrow(tab)) {
+  print(
+    kable(tab,
+          caption = "Gelman–Rubin (R-hat) and Effective Sample Size by Outcome",
+          align   = c("l","r","r")) %>%
+    kable_styling(full_width=FALSE, bootstrap_options=c("striped","hover"))
+  )
+} else {
+  cat("No outcomes available for diagnostics.\n")
+}
+
+

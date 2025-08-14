@@ -1,0 +1,385 @@
+
+---
+title: "Bayesian Network Meta‑analysis – `r params$outcome`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+params:
+  outcome: AE                                            
+  file_path: C:/Users/risha/OneDrive/Desktop/Insomnia_consol_NMA.xlsx
+  reference: Placebo
+  mcmc_fast: 'false'
+  output_path: C:/Users/risha/OneDrive/Desktop/NMA
+  prospero_id: CRD420251088062
+---
+
+```{r setup, include = FALSE}
+# ---- global knitr options ----
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 7
+)
+
+# ---- reproducibility ----
+set.seed(123)
+```
+
+
+# User inputs & Settings
+```{r user_inputs}
+OUTCOME_NAME <- params$outcome
+FILE_PATH    <- params$file_path
+REFERENCE_TRT<- params$reference
+FAST         <- isTRUE(params$mcmc_fast)
+OUTPUT_PATH  <- params$output_path
+
+# Define outcome directions lookup table
+outcome_directions <- list(
+  SOL = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced sleep onset latency"
+  ),
+  PSQI = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced sleep disturbance"
+  ),
+  WASO = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced wake after sleep onset"
+  ),
+  NOA = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced number of awakenings"
+  ),
+  ISI = list(
+    larger_better = FALSE,
+    direction = "lower",
+    interpretation = "Reduced insomnia severity"
+  ),
+  TST = list(
+    larger_better = TRUE,
+    direction = "higher",
+    interpretation = "Increased total sleep time"
+  ),
+  SE = list(
+    larger_better = TRUE,
+    direction = "higher",
+    interpretation = "Increased sleep efficiency"
+  )
+)
+
+outcome_settings <- outcome_directions[[OUTCOME_NAME]]
+
+LARGER_BETTER <- outcome_settings$larger_better
+DIRECTION <- outcome_settings$direction
+INTERPRETATION <- outcome_settings$interpretation
+
+
+#output settings
+BASE_DIR <- file.path(OUTPUT_PATH, OUTCOME_NAME)
+FIGURES_DIR <- file.path(BASE_DIR, "figures")
+TABLES_DIR  <- file.path(BASE_DIR, "tables")
+
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+FIG_DPI <- 600
+FIG_FORMAT <- "tiff"
+COMPRESSION <- "lzw"
+
+# MCMC settings (set for protocol)
+ITER  <- if (FAST) 200 else 100000
+BURN  <- if (FAST) 100 else  50000
+ADAPT <- if (FAST)  20  else   5000
+CHAINS<- 3
+
+```
+
+```{r save_functions}
+# Function to save figures
+save_figure <- function(plot_object, filename) {
+  full_path <- file.path(FIGURES_DIR, paste0(filename, "_", OUTCOME_NAME, ".", FIG_FORMAT))
+  
+  if ("ggplot" %in% class(plot_object)) {
+    ggsave(filename = full_path, plot = plot_object, dpi = FIG_DPI, 
+           compression = COMPRESSION, bg = "white")
+  } else {
+    tiff(full_path, res = FIG_DPI, compression = COMPRESSION)
+    print(plot_object)
+    dev.off()
+  }
+  cat("Figure saved:", full_path, "\n")
+}
+
+# Function to save tables as images and csv data
+save_table <- function(table_data, filename, caption = "") {
+  csv_path <- file.path(TABLES_DIR, paste0(filename, "_", OUTCOME_NAME, ".csv"))
+  tiff_path <- file.path(TABLES_DIR, paste0(filename, "_", OUTCOME_NAME, ".tiff"))
+  
+  write.csv(table_data, csv_path, row.names = FALSE)
+  
+  if (require(kableExtra, quietly = TRUE) && require(webshot2, quietly = TRUE)) {
+    formatted_table <- knitr::kable(table_data, caption = caption, format = "html") %>%
+      kableExtra::kable_styling(full_width = FALSE, font_size = 12)
+    
+    kableExtra::save_kable(formatted_table, file = tiff_path, zoom = 2)
+    cat("Table image saved:", tiff_path, "\n")
+  }
+  cat("Table data saved:", csv_path, "\n")
+}
+```
+
+
+
+# 1. Load libraries
+```{r libs}
+# set CRAN mirror if none
+if (getOption("repos")[["CRAN"]] %in% c("@CRAN@", NULL)) {
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
+}
+
+required_pkgs <- c(
+  "tidyverse", "readxl", "BUGSnet", "R2jags",
+  "meta", "metafor", "tidygraph", "ggraph",
+  "igraph", "kableExtra", "gridExtra", "RColorBrewer",
+  "remotes"
+)
+
+for (p in required_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, dependencies = TRUE)
+  library(p, character.only = TRUE)
+}
+```
+
+
+# 2. Load & prepare data
+```{r load_data}
+data_raw <- readxl::read_excel(FILE_PATH, sheet = OUTCOME_NAME) %>%
+  mutate(across(c(ae_rate, n),
+                as.numeric),
+         outcome = OUTCOME_NAME,
+         largerbetter = LARGER_BETTER) %>%
+  filter(!is.na(mean), !is.na(sd), !is.na(n), !is.na(treatment_class), !is.na(study))
+
+# quick checks
+cat("Rows :", nrow(data_raw), "\n",
+    "Studies :", dplyr::n_distinct(data_raw$study), "\n",
+    "Treatments :", dplyr::n_distinct(data_raw$treatment), "\n")
+
+knitr::kable(
+  data_raw %>% 
+    group_by(treatment_class) %>%
+    summarise(n_studies = n_distinct(study),
+              total_n   = sum(n), .groups = "drop"),
+  caption = glue::glue("Summary by treatment class – {OUTCOME_NAME}")
+) %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+# 4. Network preparation (BUGSnet)
+```{r prep_bugsnet}
+data_prep <- data.prep(
+  arm.data  = data_raw,
+  varname.t = "treatment_class",
+  varname.s = "study"
+)
+```
+
+# 5. Network plot 
+```{r network_plot}
+# colours
+treatment_class_colors <- c(
+  "Melatonin-IR" = "#E69F00",
+  "Melatonin-PR" = "#D55E00",
+  "Ashwagandha"  = "#009E73",
+  "Valerian"     = "#0072B2",
+  "Tart-cherry"  = "#CC79A7",
+  "Saffron"      = "#F0E442",
+  "Placebo"      = "grey50"
+)
+
+
+```
+
+```{r}
+
+# -- Per-arm AE proportion (units normalised only) -----------------------------
+arm_rates <- data_raw %>%
+  filter(!is.na(ae_rate)) %>%            # safety: exclude missing AE rows
+  mutate(
+    ae_prop = case_when(
+      ae_rate > 1 ~ ae_rate / 100,       # % -> proportion
+      TRUE        ~ ae_rate              # already a proportion
+    )
+  )
+
+# -- Node data: n-weighted AE rate, # trials, total n --------------------------
+ae_node_data <- arm_rates %>%
+  group_by(treatment_class) %>%
+  summarise(
+    rate_prop = weighted.mean(ae_prop, w = n, na.rm = TRUE),
+    total_n   = sum(n, na.rm = TRUE),
+    k_trials  = n_distinct(study),
+    .groups   = "drop"
+  ) %>%
+  transmute(
+    name            = treatment_class,
+    avg_ae_rate_pct = 100 * rate_prop,
+    k_trials,
+    total_n,
+    label = paste0(
+      name, "\n",
+      sprintf("%.1f%%", avg_ae_rate_pct),
+      "  (k=", k_trials, "; n=", scales::comma(total_n), ")"
+    )
+  )
+
+# -- Edge data: number of studies per comparison --------------------------------
+ae_edges <- arm_rates %>%
+  group_by(study) %>%
+  filter(n() >= 2) %>%
+  summarise(treatments = list(unique(treatment_class)), .groups = "drop") %>%
+  mutate(pairs = purrr::map(treatments, ~combn(sort(.x), 2, simplify = FALSE))) %>%
+  tidyr::unnest(pairs) %>%
+  mutate(from = purrr::map_chr(pairs, 1), to = purrr::map_chr(pairs, 2)) %>%
+  count(from, to, name = "weight")  # weight = # studies
+
+# -- Build graph and layout -----------------------------------------------------
+ae_net_graph <- tidygraph::tbl_graph(nodes = ae_node_data, edges = ae_edges, directed = FALSE)
+lay <- ggraph::create_layout(ae_net_graph, layout = "fr")
+
+# -- Edge-label midpoints (for study-count labels) ------------------------------
+nodes_pos <- as.data.frame(lay)[, c("name", "x", "y")]
+edge_labels <- ae_edges %>%
+  dplyr::left_join(nodes_pos, by = c("from" = "name")) %>%
+  dplyr::rename(x_from = x, y_from = y) %>%
+  dplyr::left_join(nodes_pos, by = c("to" = "name")) %>%
+  dplyr::rename(x_to = x, y_to = y) %>%
+  dplyr::mutate(x = (x_from + x_to) / 2, y = (y_from + y_to) / 2)
+
+# -- Plot -----------------------------------------------------------------------
+ae_plot <- ggraph(ae_net_graph, layout = lay) +
+  geom_edge_link(aes(width = weight), colour = "grey70", show.legend = TRUE) +
+  geom_text(data = edge_labels, aes(x = x, y = y, label = weight), size = 3, alpha = 0.9) +
+  geom_node_point(aes(size = avg_ae_rate_pct, fill = name), shape = 21, colour = "black") +
+  geom_node_text(aes(label = label), repel = TRUE, fontface = "bold", lineheight = 0.95) +
+  scale_fill_manual(values = treatment_class_colors, name = "Treatment Class") +
+  scale_size_continuous(range = c(3, 20), name = "Average AE rate (%)") +
+  scale_edge_width_continuous(range = c(0.6, 5), name = "# studies") +
+  guides(
+    fill = guide_legend(override.aes = list(size = 8)),
+    edge_width = guide_legend(order = 1),
+    size = guide_legend(order = 2)
+  ) +
+  theme_void(base_size = 12) +
+  labs(
+    title    = glue::glue("Adverse Event Network with qualitative studies"),
+    subtitle = "Node size = n-weighted mean AE rate;Edge width/label = number of studies.",
+    caption  = "AE rate = participants with ≥1 AE per arm/N. Values are n-weighted means, not pooled meta-analytic estimates."
+  )
+
+print(ae_plot)
+# save_figure(ae_plot, "network_ae")
+
+```
+
+```{r NMA}
+ae_data_continuous <- data_raw %>%
+  filter(!is.na(ae_rate)) %>%
+  mutate(
+    # Convert to proportion
+    ae_prop = case_when(
+      ae_rate > 1 ~ ae_rate / 100,
+      TRUE ~ ae_rate
+    ),
+    # Add continuity correction for zero events
+    ae_prop_adj = case_when(
+      ae_prop == 0 ~ 0.5/n,
+      ae_prop == 1 ~ (n-0.5)/n,
+      TRUE ~ ae_prop
+    ),
+    # Logit transformation
+    logit_ae = log(ae_prop_adj / (1 - ae_prop_adj)),
+    # Standard error of logit
+    se_logit = sqrt(1/(ae_prop_adj * n) + 1/((1-ae_prop_adj) * n))
+  ) %>%
+  select(study, treatment_class, mean = logit_ae, sd = se_logit, n)
+
+# Prepare data using standard continuous approach
+ae_data_prep <- data.prep(
+  arm.data = ae_data_continuous,
+  varname.t = "treatment_class",
+  varname.s = "study"
+)
+```
+
+```{r comparative safety}
+# First, get the placebo rate
+placebo_rate <- ae_node_data %>% 
+  filter(name == "Placebo") %>% 
+  pull(avg_ae_rate_pct)
+
+# Then create the comparison table
+ae_comparison_table <- ae_node_data %>%
+  mutate(
+    OR_vs_placebo = avg_ae_rate_pct / placebo_rate,
+    RD_vs_placebo = avg_ae_rate_pct - placebo_rate,
+    NNH = ifelse(RD_vs_placebo > 0, 100/RD_vs_placebo, NA)
+  ) %>%
+  arrange(avg_ae_rate_pct)
+```
+
+
+
+
+
+
+
+```{r ch}
+# Create ratios vs placebo table
+ae_comparison_table <- ae_node_data %>%
+  mutate(
+    OR_vs_placebo = avg_ae_rate_pct / placebo_rate,
+    RD_vs_placebo = avg_ae_rate_pct - placebo_rate,
+    NNH = ifelse(RD_vs_placebo > 0, 100/RD_vs_placebo, NA)
+  ) %>%
+  arrange(avg_ae_rate_pct)
+
+save_table(ae_comparison_table, "ae_comparisons", 
+           caption = "Comparative Safety Metrics vs Placebo")
+```
+
+```{r summary}
+ae_summary <- arm_rates %>%
+  group_by(treatment_class) %>%
+  summarise(
+    n_studies = n_distinct(study),
+    total_n = sum(n),
+    ae_events = sum(ae_prop * n),
+    ae_rate_percent = sprintf("%.1f%%", 100 * weighted.mean(ae_prop, w = n)),
+    ae_95ci = sprintf("[%.1f-%.1f]", 
+                      100 * (ae_events/total_n - 1.96*sqrt(ae_events/total_n*(1-ae_events/total_n)/total_n)),
+                      100 * (ae_events/total_n + 1.96*sqrt(ae_events/total_n*(1-ae_events/total_n)/total_n))),
+    .groups = "drop"
+  )
+
+print(ae_summary)
+```
+
+
+
+
+
